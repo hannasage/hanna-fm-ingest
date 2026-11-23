@@ -1,6 +1,7 @@
 {
   "name": "hanna-fm-ingest",
   "version": "0.1.0",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -10,7 +11,6 @@
     "import-export": "tsx src/cli.ts import-export",
     "resolve-items": "tsx src/cli.ts resolve-items",
     "schema:sync": "tsx src/schema-sync.ts",
-    "schema:check": "tsx src/schema-check.ts",
     "schema:check": "tsx src/schema-check.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
