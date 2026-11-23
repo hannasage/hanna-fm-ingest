@@ -13,7 +13,7 @@ import {
  * It always checks them against the manifest that `schema:sync` wrote.
  * When HANNA_FM_PATH names a sibling site clone, it also compares them with that clone.
  *
- * The site repository is private, so CI cannot read it and CI does not run the site comparison.
+ * CI runs the site comparison too: it clones the public hanna-fm repository and sets HANNA_FM_PATH to the clone.
  */
 function main(): void {
   const root = process.cwd();

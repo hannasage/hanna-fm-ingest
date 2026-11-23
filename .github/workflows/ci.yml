@@ -2,6 +2,8 @@ name: ci
 
 on:
   pull_request:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -25,6 +27,22 @@ jobs:
           cache: npm
 
       - run: npm ci
+
+      # The site repository is public and owns the schema. This compares the vendored migrations with
+      # its main branch. The clone is shallow and anonymous: no token, no secret. A pull request that adds
+      # a migration is green only after the site pull request that adds the same file has merged.
+      - name: Check the vendored migrations against hanna-fm main
+        env:
+          SITE_DIR: ${{ runner.temp }}/hanna-fm
+        run: |
+          git clone --depth 1 https://github.com/hannasage/hanna-fm.git "$SITE_DIR" || {
+            echo "::error::could not clone hanna-fm main, so the vendored migrations could not be compared"
+            exit 1
+          }
+          HANNA_FM_PATH="$SITE_DIR" npm run schema:check || {
+            echo "::error::the vendored migrations differ from hanna-fm main; run schema:sync"
+            exit 1
+          }
 
       # A local Supabase stack from the Supabase CLI. Migrations and the
       # synthetic seed file load on start. Keys stay in the job's memory:
