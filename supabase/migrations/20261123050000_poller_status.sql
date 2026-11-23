@@ -22,3 +22,4 @@ alter table public.poller_state enable row level security;
 alter table public.poller_state force row level security;
 revoke all on public.poller_runs from anon, authenticated, public;
 revoke all on public.poller_state from anon, authenticated, public;
+revoke all on sequence public.poller_runs_id_seq from anon, authenticated, public;

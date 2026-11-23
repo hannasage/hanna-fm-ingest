@@ -36,11 +36,13 @@ export async function storeBatch(client: SupabaseClient, batch: PlayRow[]): Prom
     // The error text can quote a row or the address. Report a plain code only.
     throw new UserError(
       `The database refused a batch (code ${printableCode(error.code)}). Check SUPABASE_URL and SUPABASE_SECRET_KEY, then run the command again: plays already stored are skipped.`,
+      "database_error",
     );
   }
   if (data === null) {
     throw new UserError(
       "The database gave no answer for a batch, so nothing can be counted. Run the command again: plays already stored are skipped.",
+      "database_error",
     );
   }
   return data.length;

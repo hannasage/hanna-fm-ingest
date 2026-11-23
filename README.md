@@ -100,13 +100,28 @@ Every `poll` run that gets as far as the database leaves one row in `poller_runs
 | `future_cursor` | The newest stored play is more than 60 seconds ahead of the clock |
 | `malformed_items` | The run finished, but an item could not be read |
 | `page_cap` | The run reached `POLL_MAX_PAGES` pages |
-| `other` | Anything else: an unexpected Spotify status, a database refusal, or no older page to go back to |
+| `spotify_unavailable` | Spotify answered 5xx, or a status the poller does not expect |
+| `database_error` | The database refused a read or a write, or gave an answer the poll cannot read |
+| `stalled` | The page walk could not go back to an older page |
+| `bug` | An exception the poller did not plan for. Its text is never stored |
+| `other` | A last resort: a planned stop that names no kind |
 
-A run with two problems gets one kind: `page_cap` wins over `malformed_items`.
+A run with two problems gets one kind: a stop short of older plays (`page_cap` or `stalled`) wins over `malformed_items`.
 
 Recording never changes a run's result. If the insert fails, the run prints `::warning::could not record the poll run` and keeps its exit code. The warning holds no detail. A run that cannot reach the database at all has nothing to write: it exits 1 as before and prints the same warning.
 
-At the end of a run, once its own row is written, the poll deletes `poller_runs` rows whose `finished_at` is more than `POLLER_RUNS_KEEP_DAYS` (90, in `src/settings.ts`) days old. If that delete fails, the run prints `::warning::could not delete old poll run records` and keeps its exit code. Each database call of the record waits at most `RECORD_TIMEOUT_MS` (10 seconds).
+At the end of a run, once its own row is written, the poll deletes `poller_runs` rows whose `finished_at` is more than `POLLER_RUNS_KEEP_DAYS` (90, in `src/settings.ts`) days old. Two rows are never deleted, however old: the newest `ok` row and the newest `failed` row, so a long outage still leaves the site its last success and last failure. The delete is skipped when the runner's clock is more than `CLOCK_SKEW_TOLERANCE_MS` (5 minutes) behind the newest row's `finished_at`, because a wrong clock would put the cutoff in the wrong place. If a database call of the delete fails, the run prints `::warning::could not delete old poll run records` and keeps its exit code. Each database call of the record waits at most `RECORD_TIMEOUT_MS` (10 seconds).
+
+A stale status on the site does not always mean Spotify or the database failed. The workflow itself can fail before it records anything (a bad setting, a failed install, a disabled schedule). When the status is stale, check the Actions tab of this repository as well.
+
+## Login reminder
+
+At the end of every poll run that reached the database, the poll reads `spotify_authorized_at` from `poller_state` and may print one line, a GitHub annotation on the run page:
+
+- `::warning::Spotify login date is not recorded. Run set-state spotify_authorized_at <date>.` when the key is absent or its value is not a date.
+- `::warning::Spotify login is N days old. Re-authorize it before day 180.` when the login is `LOGIN_WARN_DAYS` (150, in `src/settings.ts`) days old or more.
+
+The reminder never changes the exit code. If the read fails, it prints nothing. It never prints the stored value or any secret.
 
 ## Record when the login was authorized
 
@@ -118,6 +133,8 @@ npm run set-state -- spotify_authorized_at 2026-11-20
 `set-state <key> <value>` writes one row of `poller_state`, so the site can warn before the Spotify login runs out (refresh tokens last 6 months from authorization). Only the key `spotify_authorized_at` is allowed for now (`ALLOWED_STATE_KEYS` in `src/settings.ts`). The value is a real date, `YYYY-MM-DD` (read as UTC), or an ISO time such as `2026-11-20T10:00:00Z`. It is stored as given. A value in the future is refused.
 
 Run it again after each new authorization. It is safe to run twice: one key keeps one row, and a second call replaces the value.
+
+`set-state` trusts what it is given. It can write a recent date for a login that is really old, and so hide a true expiry: the reminder and the site then count from the date written. Write the date of the real authorization and no other. Only a person who holds the secret key (`SUPABASE_SECRET_KEY`) can run it, because the table refuses the browser roles.
 
 A bad argument exits 2 with one plain line and stores nothing. A database failure exits 1. The command prints only `Recorded spotify_authorized_at.` on success. It never prints the value or any secret.
 

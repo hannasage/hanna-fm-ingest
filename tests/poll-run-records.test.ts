@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { POLL_LIMIT, POLL_MAX_PAGES, POLLER_RUNS_KEEP_DAYS } from "../src/settings.ts";
+import { CLOCK_SKEW_TOLERANCE_MS, LOGIN_WARN_DAYS, POLL_LIMIT, POLL_MAX_PAGES, POLLER_RUNS_KEEP_DAYS } from "../src/settings.ts";
 import { counts, runPoll, type CliResult } from "./support/cli.ts";
 import { adminClient, localStack } from "./support/env.ts";
 import {
@@ -24,14 +24,29 @@ const WARNING = "::warning::could not record the poll run";
 const PRUNE_WARNING = "::warning::could not delete old poll run records";
 const KIND_PATTERN = /^[a-z0-9_]{1,64}$/;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const NOT_RECORDED = "::warning::Spotify login date is not recorded. Run set-state spotify_authorized_at <date>.";
+const loginOld = (days: number) => `::warning::Spotify login is ${days} days old. Re-authorize it before day 180.`;
 
 const db = adminClient();
+
+/** A login date that many whole days old, plus a minute, so a slow run cannot tip it into the day before. */
+const authorizedDaysAgo = (days: number) => new Date(Date.now() - days * DAY_MS - 60_000).toISOString();
+
+async function setAuthorized(value: string | null): Promise<void> {
+  const cleared = await db.from("poller_state").delete().neq("key", "");
+  if (cleared.error) throw new Error(`Could not clear poller_state: ${cleared.error.code}`);
+  if (value === null) return;
+  const { error } = await db.from("poller_state").insert({ key: "spotify_authorized_at", value });
+  if (error) throw new Error(`Could not seed poller_state: ${error.code}`);
+}
 
 beforeEach(async () => {
   for (const table of ["plays", "poller_runs"]) {
     const { error } = await db.from(table).delete().gt("id", 0);
     if (error) throw new Error(`Could not clear ${table}: ${error.code}`);
   }
+  // A recent login date by default, so the login reminder stays quiet unless a test is about it.
+  await setAuthorized(authorizedDaysAgo(1));
 });
 
 const tokenOk = (): Answer =>
@@ -150,6 +165,17 @@ describe("poll run records: a run that finished ok", () => {
     const rows = await runs();
     expect(rows).toHaveLength(2);
     expect(rows[1]).toMatchObject({ outcome: "ok", fetched: 3, stored: 1, failure_kind: null });
+  });
+
+  it("writes an ok row with zero stored when every play is a repeat, and exits 0", async () => {
+    const items = [item(1, "2026-11-20T10:00:00Z"), item(2, "2026-11-20T10:04:00Z")];
+    await poll({ recent: () => page(items) });
+    const again = await poll({ recent: () => page(items) });
+
+    expect(again.result.status).toBe(0);
+    const rows = await runs();
+    expect(rows).toHaveLength(2);
+    expect(rows[1]).toMatchObject({ outcome: "ok", fetched: 2, stored: 0, failure_kind: null });
   });
 
   it("writes an ok row with zero counts for a quiet window", async () => {
@@ -275,9 +301,37 @@ describe("poll run records: a run that failed", () => {
       stored: null,
     },
     {
-      name: "Spotify answers with an unexpected status",
+      name: "Spotify answers 500",
       scenario: { recent: () => ({ status: 500, body: `oops ${ACCESS_TOKEN}` }) },
-      kind: "other",
+      kind: "spotify_unavailable",
+      fetched: null,
+      stored: null,
+    },
+    {
+      name: "Spotify answers 503",
+      scenario: { recent: () => ({ status: 503, body: "" }) },
+      kind: "spotify_unavailable",
+      fetched: null,
+      stored: null,
+    },
+    {
+      name: "Spotify answers an unexpected 4xx",
+      scenario: { recent: () => ({ status: 418, body: "" }) },
+      kind: "spotify_unavailable",
+      fetched: null,
+      stored: null,
+    },
+    {
+      name: "the token call answers 500",
+      scenario: { token: () => ({ status: 500, body: `oops ${REFRESH_TOKEN}` }) },
+      kind: "spotify_unavailable",
+      fetched: null,
+      stored: null,
+    },
+    {
+      name: "the token call answers an unexpected 400 that is not invalid_grant",
+      scenario: { token: () => json({ error: "unsupported_grant_type" }, 400) },
+      kind: "spotify_unavailable",
       fetched: null,
       stored: null,
     },
@@ -333,21 +387,37 @@ describe("poll run records: a run that failed", () => {
     expect(await onlyRun(result)).toMatchObject({ outcome: "failed", failure_kind: "future_cursor", fetched: null, stored: null });
   });
 
-  it("writes kind other when Spotify gives no older page to go back to", async () => {
+  it("writes kind stalled when Spotify gives no older page to go back to", async () => {
     const same = Array.from({ length: POLL_LIMIT }, (_, index) => item(index + 1, seconds("2026-11-20T08:00:00Z", index * 100)));
     const { result } = await poll({ recent: () => page(same) });
     expect(result.status).toBe(1);
-    expect(await onlyRun(result)).toMatchObject({ outcome: "failed", failure_kind: "other", fetched: POLL_LIMIT, stored: POLL_LIMIT });
+    expect(await onlyRun(result)).toMatchObject({ outcome: "failed", failure_kind: "stalled", fetched: POLL_LIMIT, stored: POLL_LIMIT });
   });
 
-  it("writes kind other, with the counts so far, when the database refuses a batch of plays", async () => {
+  it("writes kind database_error when the database refuses a read of the plays", async () => {
+    const proxy = await startProxy(() => ({ status: 500, body: JSON.stringify({ message: CLIENT_SECRET, code: "XX000" }) }), {
+      table: "plays",
+      methods: ["GET"],
+    });
+    try {
+      const { result, fake } = await poll({}, { SUPABASE_URL: proxy.url });
+      expect(result.status).toBe(1);
+      expect(fake.tokenRequests).toHaveLength(0);
+      expect(result.stderr).toContain("The database refused a read");
+      expect(await onlyRun(result)).toMatchObject({ outcome: "failed", failure_kind: "database_error", fetched: null, stored: null });
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("writes kind database_error, with the counts so far, when the database refuses a batch of plays", async () => {
     const proxy = await startProxy(() => ({ status: 500, body: JSON.stringify({ message: CLIENT_SECRET, code: "XX000" }) }));
     try {
       const { result } = await poll({ recent: () => page([item(1, "2026-11-20T10:00:00Z")]) }, { SUPABASE_URL: proxy.url });
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("The database refused a batch");
       expect(result.stderr).not.toContain("::warning::");
-      expect(await onlyRun(result)).toMatchObject({ outcome: "failed", failure_kind: "other", fetched: 1, stored: 0 });
+      expect(await onlyRun(result)).toMatchObject({ outcome: "failed", failure_kind: "database_error", fetched: 1, stored: 0 });
     } finally {
       await proxy.close();
     }
@@ -386,6 +456,7 @@ describe("poll run records: nothing to write", () => {
     expect(result.status).toBe(1);
     expect(fake.tokenRequests).toHaveLength(0);
     expect(result.stderr).toContain("The database refused a read");
+    expect(result.stderr).not.toContain("Spotify login");
     expect(secretsFoundIn(result.output, secrets())).toEqual([]);
     expect(await runs()).toEqual([]);
   });
@@ -467,22 +538,26 @@ describe("poll run records: a record that cannot be written", () => {
 });
 
 describe(`poll run records: deleting rows older than ${POLLER_RUNS_KEEP_DAYS} days`, () => {
-  async function seedRun(daysAgo: number): Promise<number> {
-    const finished = new Date(Date.now() - daysAgo * DAY_MS);
+  /** A stored run that finished that many days ago. `minutesAhead` puts it in the runner's future instead. */
+  async function seedRun(daysAgo: number, outcome: "ok" | "failed" = "ok", minutesAhead = 0): Promise<number> {
+    const finished = new Date(Date.now() - daysAgo * DAY_MS + minutesAhead * 60_000);
     const { data, error } = await db
       .from("poller_runs")
       .insert({
         started_at: new Date(finished.getTime() - 1000).toISOString(),
         finished_at: finished.toISOString(),
-        outcome: "ok",
-        fetched: 1,
-        stored: 1,
+        outcome,
+        fetched: outcome === "ok" ? 1 : null,
+        stored: outcome === "ok" ? 1 : null,
+        failure_kind: outcome === "ok" ? null : "network",
       })
       .select("id")
       .single();
     if (error || !data) throw new Error(`Could not seed a run: ${error?.code}`);
     return (data as { id: number }).id;
   }
+
+  const ids = async () => (await runs()).map((row) => row.id);
 
   it("is a named setting of 90 days", () => {
     expect(POLLER_RUNS_KEEP_DAYS).toBe(90);
@@ -507,7 +582,7 @@ describe(`poll run records: deleting rows older than ${POLLER_RUNS_KEEP_DAYS} da
   });
 
   it("also runs at the end of a failed run", async () => {
-    const old = await seedRun(POLLER_RUNS_KEEP_DAYS + 5);
+    const old = await seedRun(POLLER_RUNS_KEEP_DAYS + 5, "failed");
     const { result } = await poll({ recent: () => json({}, 429) });
     expect(result.status).toBe(1);
     const rows = await runs();
@@ -531,6 +606,86 @@ describe(`poll run records: deleting rows older than ${POLLER_RUNS_KEEP_DAYS} da
     }
   });
 
+  it("is a named clock tolerance of 5 minutes", () => {
+    expect(CLOCK_SKEW_TOLERANCE_MS).toBe(5 * 60 * 1000);
+  });
+
+  it("keeps the newest ok row however old, when the new run is a failure", async () => {
+    // A 91-day outage: the last good run is older than the limit. The site still needs it for its last-success time.
+    const newestOk = await seedRun(POLLER_RUNS_KEEP_DAYS + 1, "ok");
+    const olderOk = await seedRun(POLLER_RUNS_KEEP_DAYS + 40, "ok");
+    const olderFailed = await seedRun(POLLER_RUNS_KEEP_DAYS + 60, "failed");
+
+    const { result } = await poll({ recent: () => json({}, 429) });
+    expect(result.status).toBe(1);
+
+    const left = await ids();
+    expect(left).toContain(newestOk);
+    expect(left).not.toContain(olderOk);
+    expect(left).not.toContain(olderFailed);
+    expect(left).toHaveLength(2);
+  });
+
+  it("keeps the newest failed row however old, when the new run is ok", async () => {
+    const newestFailed = await seedRun(POLLER_RUNS_KEEP_DAYS + 1, "failed");
+    const olderFailed = await seedRun(POLLER_RUNS_KEEP_DAYS + 40, "failed");
+    const olderOk = await seedRun(POLLER_RUNS_KEEP_DAYS + 60, "ok");
+
+    const { result } = await poll({});
+    expect(result.status).toBe(0);
+
+    const left = await ids();
+    expect(left).toContain(newestFailed);
+    expect(left).not.toContain(olderFailed);
+    expect(left).not.toContain(olderOk);
+    expect(left).toHaveLength(2);
+  });
+
+  it("keeps both newest rows, an ok one and a failed one, after a 91-day outage", async () => {
+    const ok = await seedRun(POLLER_RUNS_KEEP_DAYS + 1, "ok");
+    const failed = await seedRun(POLLER_RUNS_KEEP_DAYS + 2, "failed");
+    const oldOk = await seedRun(POLLER_RUNS_KEEP_DAYS + 3, "ok");
+    const oldFailed = await seedRun(POLLER_RUNS_KEEP_DAYS + 4, "failed");
+
+    // The new run is ok, so it is the newest ok row. Then the 91-day-old ok row is plain old data.
+    const { result } = await poll({});
+    expect(result.status).toBe(0);
+
+    const left = await ids();
+    expect(left).toContain(failed);
+    expect(left).not.toContain(ok);
+    expect(left).not.toContain(oldOk);
+    expect(left).not.toContain(oldFailed);
+    expect(left).toHaveLength(2);
+  });
+
+  it("skips the delete when the runner clock is more than 5 minutes behind the newest row", async () => {
+    // A row finished 10 minutes ahead of this run's clock: the clock is behind, so the cutoff cannot be trusted.
+    const ahead = await seedRun(0, "ok", 10);
+    const old = await seedRun(POLLER_RUNS_KEEP_DAYS + 30, "ok");
+
+    const { result } = await poll({});
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+
+    const left = await ids();
+    expect(left).toContain(ahead);
+    expect(left).toContain(old);
+    expect(left).toHaveLength(3);
+  });
+
+  it("still deletes when the newest row is only a little ahead, inside the 5 minute tolerance", async () => {
+    const ahead = await seedRun(0, "ok", 2);
+    const old = await seedRun(POLLER_RUNS_KEEP_DAYS + 30, "ok");
+
+    const { result } = await poll({});
+    expect(result.status).toBe(0);
+
+    const left = await ids();
+    expect(left).toContain(ahead);
+    expect(left).not.toContain(old);
+  });
+
   it("warns, and keeps the exit code, when the delete fails", async () => {
     const proxy = await startProxy(() => ({ status: 500, body: JSON.stringify({ message: CLIENT_SECRET }) }), {
       table: "poller_runs",
@@ -545,5 +700,125 @@ describe(`poll run records: deleting rows older than ${POLLER_RUNS_KEEP_DAYS} da
       await proxy.close();
     }
     expect(await runs()).toHaveLength(1);
+  });
+});
+
+describe(`poll run records: the login reminder (warns from ${LOGIN_WARN_DAYS} days)`, () => {
+  it("is a named setting of 150 days", () => {
+    expect(LOGIN_WARN_DAYS).toBe(150);
+  });
+
+  it("warns that the date is not recorded when the key is absent, and keeps exit 0", async () => {
+    await setAuthorized(null);
+    const { result } = await poll({});
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe(`${NOT_RECORDED}\n`);
+    expect(await runs()).toHaveLength(1);
+  });
+
+  it("is silent when the login is one day under the limit", async () => {
+    await setAuthorized(authorizedDaysAgo(LOGIN_WARN_DAYS - 1));
+    const { result } = await poll({});
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+  });
+
+  it("warns, with the whole days, when the login is exactly the limit old", async () => {
+    await setAuthorized(authorizedDaysAgo(LOGIN_WARN_DAYS));
+    const { result } = await poll({});
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe(`${loginOld(LOGIN_WARN_DAYS)}\n`);
+  });
+
+  it("warns with the real age when the login is older still", async () => {
+    await setAuthorized(authorizedDaysAgo(171));
+    const { result } = await poll({});
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe(`${loginOld(171)}\n`);
+  });
+
+  it("reads a plain date as the start of that day in UTC", async () => {
+    const day = new Date(Date.now() - 160 * DAY_MS).toISOString().slice(0, 10);
+    await setAuthorized(day);
+    const { result } = await poll({});
+    expect(result.stderr).toMatch(/^::warning::Spotify login is 160 days old\. Re-authorize it before day 180\.\n$/);
+  });
+
+  it("warns that the date is not recorded when the stored value is not a date", async () => {
+    await setAuthorized("not a date");
+    const { result } = await poll({});
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe(`${NOT_RECORDED}\n`);
+  });
+
+  it("is silent when the stored date is in the future", async () => {
+    await setAuthorized(new Date(Date.now() + 3 * DAY_MS).toISOString());
+    const { result } = await poll({});
+    expect(result.stderr).toBe("");
+  });
+
+  it("never prints the stored value or a secret", async () => {
+    const value = authorizedDaysAgo(160);
+    await setAuthorized(value);
+    const { result } = await poll({});
+    expect(result.stderr).toBe(`${loginOld(160)}\n`);
+    expect(result.output).not.toContain(value);
+    expect(result.output).not.toContain(value.slice(0, 10));
+    expect(secretsFoundIn(result.output, secrets())).toEqual([]);
+  });
+
+  it("also warns at the end of a failed run, and keeps exit 1", async () => {
+    await setAuthorized(authorizedDaysAgo(155));
+    const { result } = await poll({ recent: () => json({}, 429) });
+    expect(result.status).toBe(1);
+    const lines = result.stderr.trimEnd().split("\n");
+    expect(lines[0]).toMatch(/^Spotify is limiting requests/);
+    expect(lines[lines.length - 1]).toBe(loginOld(155));
+  });
+
+  it("also warns at the end of a run that finished with a problem, after the error annotation", async () => {
+    await setAuthorized(null);
+    const { result } = await poll({ recent: () => page([item(1, "2026-11-20T10:00:00Z"), item(2, "not a date")]) });
+    expect(result.status).toBe(1);
+    const lines = result.stderr.trimEnd().split("\n");
+    expect(lines[0]).toMatch(/^::error::/);
+    expect(lines[lines.length - 1]).toBe(NOT_RECORDED);
+  });
+
+  it("prints nothing and changes nothing when the read fails", async () => {
+    await setAuthorized(null);
+    const proxy = await startProxy(() => ({ status: 500, body: JSON.stringify({ message: CLIENT_SECRET, code: "XX000" }) }), {
+      table: "poller_state",
+      methods: ["GET"],
+    });
+    try {
+      const { result } = await poll({}, { SUPABASE_URL: proxy.url });
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(secretsFoundIn(result.output, secrets())).toEqual([]);
+    } finally {
+      await proxy.close();
+    }
+    expect(await runs()).toHaveLength(1);
+    const state = await db.from("poller_state").select("key");
+    expect(state.data).toEqual([]);
+  });
+
+  it("prints nothing when the read answers with something that is not JSON", async () => {
+    const proxy = await startProxy(() => ({ status: 200, body: "not json" }), { table: "poller_state", methods: ["GET"] });
+    try {
+      const { result } = await poll({}, { SUPABASE_URL: proxy.url });
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("does not run when a setting is missing (exit 2)", async () => {
+    await setAuthorized(null);
+    const { result } = await poll({}, { SPOTIFY_CLIENT_ID: undefined });
+    expect(result.status).toBe(2);
+    expect(result.stderr).toBe("SPOTIFY_CLIENT_ID is not set.\n");
   });
 });

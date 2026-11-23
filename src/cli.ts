@@ -6,6 +6,7 @@ import { acquireLock, refreshLock, releaseLock, type Lease } from "./job-lock.ts
 import { MusicBrainz } from "./musicbrainz.ts";
 import { emptyPollCounts, poll, pollNotes, pollProblemKind, pollProblems } from "./poll.ts";
 import { emptyCounts, formatPollReport, formatReport } from "./report.ts";
+import { loginReminder } from "./login-reminder.ts";
 import { finishedRecord, recordRun, stoppedRecord } from "./run-record.ts";
 import { checkState, setState, STATE_MESSAGES } from "./set-state.ts";
 import { formatResolveReport, resolveItems, emptyResolveCounts } from "./resolve-items.ts";
@@ -128,6 +129,7 @@ async function runPoll(): Promise<void> {
     // which could hold a token, a key or a play.
     process.stderr.write(`${describeStop(error, "poll")}\n`);
     await recordRun(client, stoppedRecord(startedAt, counts, error), warn);
+    await warnAboutLogin(client, warn);
     process.exit(1);
   }
   process.stdout.write(formatPollReport(counts));
@@ -138,7 +140,14 @@ async function runPoll(): Promise<void> {
   // A window of only local files and episodes is green. It gets a plain note, not an annotation.
   for (const note of pollNotes(counts)) process.stderr.write(`${note}\n`);
   await recordRun(client, finishedRecord(startedAt, counts, pollProblemKind(counts)), warn);
+  await warnAboutLogin(client, warn);
   if (problems.length > 0) process.exit(1);
+}
+
+/** The last thing a poll run does: warn when the Spotify login date is missing or old. It never changes the exit code. */
+async function warnAboutLogin(client: ReturnType<typeof connect>, warn: (line: string) => void): Promise<void> {
+  const line = await loginReminder(client);
+  if (line !== null) warn(line);
 }
 
 /** Records one fact about the poller, such as when the Spotify login was authorized. Nothing it was given is ever printed. */

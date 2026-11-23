@@ -3,7 +3,14 @@ import { basename, join } from "node:path";
 import { COLUMN_KEYS, SIGNAL_KEYS } from "./mapping.ts";
 import { MAX_FILE_BYTES } from "./settings.ts";
 
-/** Why a poll run failed, as a fixed word. It is stored with the run record, so it holds no secret and no data. */
+/**
+ * Why a poll run failed, as a fixed word. It is stored with the run record, so it holds no secret and no data.
+ * - spotify_unavailable: Spotify answered 5xx, or a status the poller does not expect.
+ * - database_error: the database refused a read or a write, or answered with nothing the poll can read.
+ * - stalled: the page walk could not go back to an older page.
+ * - bug: an exception the poller did not plan for. Its text is never stored.
+ * - other: a last resort, for a planned stop that names no kind.
+ */
 export type FailureKind =
   | "login_expired"
   | "forbidden"
@@ -13,6 +20,10 @@ export type FailureKind =
   | "future_cursor"
   | "malformed_items"
   | "page_cap"
+  | "spotify_unavailable"
+  | "database_error"
+  | "stalled"
+  | "bug"
   | "other";
 
 /**

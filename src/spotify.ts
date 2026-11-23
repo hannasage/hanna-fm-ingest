@@ -142,7 +142,7 @@ export async function refreshAccessToken(config: SpotifyConfig): Promise<Token> 
     if (code === "invalid_client" || answer.status === 401 || answer.status === 403) {
       throw new UserError(MESSAGES.client, "forbidden");
     }
-    throw new UserError(MESSAGES.status(answer.status), "other");
+    throw new UserError(MESSAGES.status(answer.status), "spotify_unavailable");
   }
 
   const body = parseJson(answer.text);
@@ -179,7 +179,7 @@ export async function fetchRecentlyPlayed(
 
   if (answer.status === 401 || answer.status === 403) throw new UserError(MESSAGES.refused(answer.status), "forbidden");
   if (answer.status === 429) throw new UserError(MESSAGES.limited(retryHint(answer.headers)), "rate_limited");
-  if (answer.status !== 200) throw new UserError(MESSAGES.status(answer.status), "other");
+  if (answer.status !== 200) throw new UserError(MESSAGES.status(answer.status), "spotify_unavailable");
 
   const body = parseJson(answer.text);
   if (!isRecord(body) || !Array.isArray(body.items)) throw new UserError(MESSAGES.shape, "bad_response");
