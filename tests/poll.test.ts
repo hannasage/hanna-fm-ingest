@@ -510,17 +510,19 @@ describe("poll: setup", () => {
     },
   );
 
-  it.each(["SPOTIFY_ACCOUNTS_BASE", "SPOTIFY_API_BASE"])(
-    "exits 2 before sending anything when %s is plain http to another host",
-    async (name) => {
-      const { result, fake } = await poll({}, { [name]: "http://example.com" });
-      expect(result.status).toBe(2);
-      expect(result.stderr).toBe(`${name} must start with https://, unless the host is localhost or 127.0.0.1.\n`);
-      expect(fake.tokenRequests).toHaveLength(0);
-      expect(fake.recentRequests).toHaveLength(0);
-      expectNoSecrets(result);
-    },
-  );
+  it.each([
+    ["SPOTIFY_ACCOUNTS_BASE", "accounts.spotify.com", "http://example.com"],
+    ["SPOTIFY_API_BASE", "api.spotify.com", "http://example.com"],
+    ["SPOTIFY_ACCOUNTS_BASE", "accounts.spotify.com", "https://evil.example"],
+    ["SPOTIFY_API_BASE", "api.spotify.com", "https://api.spotify.com.evil.example"],
+  ])("exits 2 before sending anything when %s is %s, an address Spotify does not use (%s)", async (name, host, address) => {
+    const { result, fake } = await poll({}, { [name]: address });
+    expect(result.status).toBe(2);
+    expect(result.stderr).toBe(`${name} must be https://${host}, or localhost or 127.0.0.1 for tests.\n`);
+    expect(fake.tokenRequests).toHaveLength(0);
+    expect(fake.recentRequests).toHaveLength(0);
+    expectNoSecrets(result);
+  });
 
   it("exits 2 when SUPABASE_URL is plain http to another host", async () => {
     const { result } = await poll({}, { SUPABASE_URL: "http://example.com" });

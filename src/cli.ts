@@ -1,5 +1,5 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { addressProblem } from "./address.ts";
+import { addressProblem, spotifyAddressProblem } from "./address.ts";
 import { UserError } from "./files.ts";
 import { importExport } from "./import-export.ts";
 import { emptyPollCounts, poll } from "./poll.ts";
@@ -74,14 +74,18 @@ function spotifyConfig(): SpotifyConfig {
   const clientId = required("SPOTIFY_CLIENT_ID");
   const clientSecret = required("SPOTIFY_CLIENT_SECRET");
   const refreshToken = required("SPOTIFY_REFRESH_TOKEN");
-  const base = (name: string, fallback: string) =>
-    checkedAddress(name, process.env[name] || fallback).replace(/\/+$/, "");
+  const base = (name: string, fallback: string, host: string) => {
+    const address = process.env[name] || fallback;
+    const problem = spotifyAddressProblem(name, address, host);
+    if (problem !== null) fail(problem, 2);
+    return address.replace(/\/+$/, "");
+  };
   return {
     clientId,
     clientSecret,
     refreshToken,
-    accountsBase: base("SPOTIFY_ACCOUNTS_BASE", DEFAULT_SPOTIFY_ACCOUNTS_BASE),
-    apiBase: base("SPOTIFY_API_BASE", DEFAULT_SPOTIFY_API_BASE),
+    accountsBase: base("SPOTIFY_ACCOUNTS_BASE", DEFAULT_SPOTIFY_ACCOUNTS_BASE, "accounts.spotify.com"),
+    apiBase: base("SPOTIFY_API_BASE", DEFAULT_SPOTIFY_API_BASE, "api.spotify.com"),
   };
 }
 
