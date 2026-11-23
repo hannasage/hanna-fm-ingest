@@ -2,15 +2,23 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { addressProblem } from "./address.ts";
 import { UserError } from "./files.ts";
 import { importExport } from "./import-export.ts";
+import { acquireLock, refreshLock, releaseLock, type Lease } from "./job-lock.ts";
 import { MusicBrainz } from "./musicbrainz.ts";
 import { emptyCounts, formatReport } from "./report.ts";
 import { formatResolveReport, resolveItems, emptyResolveCounts } from "./resolve-items.ts";
-import { DEFAULT_MB_API_BASE } from "./settings.ts";
+import { DEFAULT_MB_API_BASE, RESOLVE_LOCK_LEASE_MS, RESOLVE_LOCK_NAME, RESOLVE_MAX_ATTEMPTS } from "./settings.ts";
 import { SupabaseCache } from "./item-store.ts";
 
 const IMPORT_USAGE =
   "Usage: import-export <path>\n  path: a Spotify Extended Streaming History .json file, or a directory of them.";
-const USAGE = `${IMPORT_USAGE}\nUsage: resolve-items\n  Reads SUPABASE_URL, SUPABASE_SECRET_KEY and MB_USER_AGENT. MB_API_BASE is for tests.`;
+const RESOLVE_USAGE = [
+  "Usage: resolve-items [--limit N] [--retry-failed]",
+  "  Reads SUPABASE_URL, SUPABASE_SECRET_KEY and MB_USER_AGENT. MB_API_BASE is for tests.",
+  "  --limit N       process at most N items, then print how many remain",
+  `  --retry-failed  try items that were left pending ${RESOLVE_MAX_ATTEMPTS} times or more`,
+  "  Exit codes: 0 done, 1 stopped or MusicBrainz was unavailable for some items, 2 bad setting or argument, 3 another run holds the lock.",
+].join("\n");
+const USAGE = `${IMPORT_USAGE}\n${RESOLVE_USAGE}`;
 
 function fail(message: string, code: number): never {
   process.stderr.write(`${message}\n`);
@@ -82,27 +90,90 @@ function userAgent(): string {
   return value;
 }
 
-async function runResolve(extra: string[]): Promise<void> {
-  if (extra.length > 0) fail(`resolve-items takes no arguments.\n${USAGE}`, 2);
+/** Reads the flags of resolve-items. Exits 2 on anything else. */
+function resolveFlags(args: string[]): { limit: number | undefined; retryFailed: boolean } {
+  let limit: number | undefined;
+  let retryFailed = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--retry-failed") {
+      retryFailed = true;
+    } else if (arg === "--limit") {
+      const value = args[index + 1];
+      index += 1;
+      if (value === undefined || !/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))) {
+        fail(`--limit needs a whole number of 1 or more.\n${RESOLVE_USAGE}`, 2);
+      }
+      limit = Number(value);
+    } else {
+      fail(`resolve-items does not take that argument.\n${RESOLVE_USAGE}`, 2);
+    }
+  }
+  return { limit, retryFailed };
+}
+
+async function runResolve(args: string[]): Promise<void> {
+  const flags = resolveFlags(args);
   const agent = userAgent();
   const base = process.env.MB_API_BASE || DEFAULT_MB_API_BASE;
   checkAddress("MB_API_BASE", base);
   const client = connect();
 
+  // One run at a time: the one-request-a-second limit is kept inside a run, so two runs would break it.
+  let lease: Lease | null;
+  try {
+    lease = await acquireLock(client, RESOLVE_LOCK_NAME, RESOLVE_LOCK_LEASE_MS);
+  } catch (error) {
+    fail(describeStop(error, "run"), 1);
+  }
+  if (lease === null) {
+    fail("Another resolve-items run holds the lock, so this one did not start and changed nothing. Wait for it to finish, then run the command again. A run that died frees the lock in 30 minutes.", 3);
+  }
+  const held = lease;
+
+  // A stop by signal frees the lock first, so the next run need not wait out the lease.
+  // From then on the run does no new item: the next heartbeat never returns, and the exit comes from here.
+  let stopping = false;
+  for (const [signal, number] of [["SIGINT", 2], ["SIGTERM", 15]] as const) {
+    process.once(signal, () => {
+      stopping = true;
+      void releaseLock(client, held).finally(() => process.exit(128 + number));
+    });
+  }
+
   const musicbrainz = new MusicBrainz({ base, userAgent: agent, cache: new SupabaseCache(client) });
   const counts = emptyResolveCounts();
   try {
-    await resolveItems(client, musicbrainz, counts);
+    await resolveItems(client, musicbrainz, counts, {
+      ...flags,
+      progress: (line) => process.stderr.write(`${line}\n`),
+      onUnavailableKind: (kind) => process.stderr.write(`MusicBrainz was unavailable: ${kind}\n`),
+      heartbeat: async () => {
+        if (stopping) await new Promise<never>(() => undefined);
+        if (!(await refreshLock(client, held, RESOLVE_LOCK_LEASE_MS))) {
+          throw new UserError("This run lost its lock, because its lease ran out and another run took it. It stopped so two runs never work at once.");
+        }
+      },
+    });
   } catch (error) {
-    counts.requests = musicbrainz.requests;
-    counts.cache_hits = musicbrainz.cacheHits;
+    // Say what went wrong, then the partial counts, on stderr. Nothing goes to stdout.
     process.stderr.write(`${describeStop(error, "run")}\n`);
     process.stderr.write(formatResolveReport(counts, { partial: true }));
+    await releaseLock(client, held);
     process.exit(1);
   }
-  counts.requests = musicbrainz.requests;
-  counts.cache_hits = musicbrainz.cacheHits;
+  await releaseLock(client, held);
+
   process.stdout.write(formatResolveReport(counts));
+  if (counts.skipped > 0 && !flags.retryFailed) {
+    process.stderr.write(
+      `${counts.skipped} items were skipped: no play names them, or they were left pending ${RESOLVE_MAX_ATTEMPTS} times or more. Pass --retry-failed to try the second kind again.\n`,
+    );
+  }
+  if (counts.remaining > 0) process.stderr.write(`${counts.remaining} items remain. Run the command again to go on.\n`);
+  if (counts.pending > 0) {
+    fail(`${counts.pending} items stayed pending because MusicBrainz was unavailable. Run the command again later.`, 1);
+  }
 }
 
 async function main(argv: string[]): Promise<void> {

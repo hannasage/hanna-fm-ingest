@@ -1,7 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { UserError } from "./files.ts";
 import type { Context, Kind } from "./matching.ts";
-import { albumKey, artistKey } from "./names.ts";
+import { albumKey, artistKey, stripNul } from "./names.ts";
 import { PAGE_SIZE } from "./settings.ts";
 import { printableCode } from "./store.ts";
 
@@ -41,9 +41,9 @@ export async function scanPlays(client: SupabaseClient): Promise<Map<string, Con
     }
     const rows = data as PlayRow[];
     for (const row of rows) {
-      const artist = row.artist_name.trim();
-      const album = row.album_name?.trim() ?? "";
-      add({ kind: "track", key: row.track_uri, name: row.track_name.trim(), uri: row.track_uri, artist, ...(album ? { album } : {}) });
+      const artist = stripNul(row.artist_name).trim();
+      const album = stripNul(row.album_name ?? "").trim();
+      add({ kind: "track", key: row.track_uri, name: stripNul(row.track_name).trim(), uri: row.track_uri, artist, ...(album ? { album } : {}) });
       add({ kind: "artist", key: artistKey(artist), name: artist });
       if (album) add({ kind: "album", key: albumKey(album, artist), name: album, artist });
     }

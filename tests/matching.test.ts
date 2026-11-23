@@ -1,9 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { albumQuery, artistQuery, decide, parseCandidate, trackQuery } from "../src/matching.ts";
+import {
+  albumQuery,
+  artistQuery,
+  decide,
+  parseCandidates,
+  readCandidates,
+  trackQuery,
+  type Candidate,
+  type Context,
+} from "../src/matching.ts";
 import { UserError } from "../src/files.ts";
 import { MATCH_MIN_SCORE } from "../src/settings.ts";
 
 const ID = "00000000-0000-4000-8000-000000000001";
+const OTHER = "00000000-0000-4000-8000-000000000002";
+const ARTIST_ID = "00000000-0000-4000-8000-000000000011";
 
 describe("queries", () => {
   it("quotes and escapes each value, and leaves out an empty artist or album", () => {
@@ -17,33 +28,70 @@ describe("queries", () => {
     expect(albumQuery({ kind: "album", key: "k", name: "SYNTH B", artist: "" })).toBe('releasegroup:"SYNTH B"');
     expect(artistQuery({ kind: "artist", key: "k", name: "SYNTH A" })).toBe('artist:"SYNTH A"');
   });
+
+  it("can leave the album out of a track query, for the retry", () => {
+    const context: Context = { kind: "track", key: "k", name: "t", artist: "SYNTH A", album: "SYNTH B" };
+    expect(trackQuery(context, { withAlbum: false })).toBe('recording:"t" AND artistname:"SYNTH A"');
+  });
 });
 
-describe("parseCandidate", () => {
-  it("reads the top hit, with a score given as text or as a number, and lower-cases the IDs", () => {
+describe("parseCandidates", () => {
+  it("reads every hit, with a score given as text or as a number, and lower-cases the IDs", () => {
     const upper = ID.toUpperCase();
-    const asText = parseCandidate({ artists: [{ id: upper, score: "95", name: "SYNTH A" }] }, "artists", "name");
-    const asNumber = parseCandidate({ artists: [{ id: ID, score: 95, name: "SYNTH A" }] }, "artists", "name");
-    expect(asText).toEqual({ mbid: ID, score: 95, name: "SYNTH A", credits: [] });
+    const asText = parseCandidates({ artists: [{ id: upper, score: "95", name: "SYNTH A" }] }, "artists", "name");
+    const asNumber = parseCandidates({ artists: [{ id: ID, score: 95, name: "SYNTH A" }] }, "artists", "name");
+    expect(asText).toEqual([{ mbid: ID, score: 95, name: "SYNTH A", credits: [] }]);
     expect(asNumber).toEqual(asText);
+    const two = parseCandidates(
+      { artists: [{ id: ID, score: "100", name: "A" }, { id: OTHER, score: "61", name: "B" }] },
+      "artists",
+      "name",
+    );
+    expect(two.map((hit) => hit.mbid)).toEqual([ID, OTHER]);
   });
 
-  it("reads artist credits and skips a credit that has no usable ID", () => {
+  it("keeps the raw score, with no rounding", () => {
+    const [hit] = parseCandidates({ artists: [{ id: ID, score: "89.6", name: "A" }] }, "artists", "name");
+    expect(hit?.score).toBe(89.6);
+  });
+
+  it("reads artist credits from the artist, and from the credited name when it differs, and skips a credit that has no usable ID", () => {
     const body = {
       recordings: [
         {
           id: ID,
           score: "100",
           title: "SYNTH T",
-          "artist-credit": [{ artist: { id: ID, name: "SYNTH A" } }, { artist: { id: "x", name: "bad" } }, "odd", {}],
+          "artist-credit": [
+            { artist: { id: ARTIST_ID, name: "SYNTH A" } },
+            { name: "SYNTH A (credited)", artist: { id: OTHER, name: "SYNTH A2" } },
+            { artist: { id: "x", name: "bad" } },
+            "odd",
+            {},
+          ],
         },
       ],
     };
-    expect(parseCandidate(body, "recordings", "title")?.credits).toEqual([{ mbid: ID, name: "SYNTH A" }]);
+    expect(parseCandidates(body, "recordings", "title")[0]?.credits).toEqual([
+      { mbid: ARTIST_ID, name: "SYNTH A" },
+      { mbid: OTHER, name: "SYNTH A2" },
+      { mbid: OTHER, name: "SYNTH A (credited)" },
+    ]);
   });
 
-  it("returns null for an empty list", () => {
-    expect(parseCandidate({ artists: [] }, "artists", "name")).toBeNull();
+  it("strips NUL characters from every name", () => {
+    const body = {
+      recordings: [
+        { id: ID, score: "100", title: "SYNTH\u0000 T", "artist-credit": [{ artist: { id: ARTIST_ID, name: "SYNTH\u0000 A" } }] },
+      ],
+    };
+    const [hit] = parseCandidates(body, "recordings", "title");
+    expect(hit?.name).toBe("SYNTH T");
+    expect(hit?.credits[0]?.name).toBe("SYNTH A");
+  });
+
+  it("returns an empty list for an empty list", () => {
+    expect(parseCandidates({ artists: [] }, "artists", "name")).toEqual([]);
   });
 
   it.each([
@@ -60,25 +108,100 @@ describe("parseCandidate", () => {
     ["a score over 100", { artists: [{ id: ID, score: "101", name: "n" }] }],
     ["a negative score", { artists: [{ id: ID, score: -1, name: "n" }] }],
     ["a score that is not a number", { artists: [{ id: ID, score: "high", name: "n" }] }],
+    ["a later hit that is malformed", { artists: [{ id: ID, score: "100", name: "n" }, { id: "x", score: "1", name: "m" }] }],
   ])("throws on %s", (_name, body) => {
-    expect(() => parseCandidate(body, "artists", "name")).toThrow(UserError);
+    expect(() => parseCandidates(body, "artists", "name")).toThrow(UserError);
+  });
+});
+
+describe("readCandidates (a cached answer)", () => {
+  const good: Candidate = { mbid: ID, score: 100, name: "SYNTH A", credits: [{ mbid: ARTIST_ID, name: "SYNTH A" }] };
+
+  it("reads what parseCandidates produced", () => {
+    expect(readCandidates([good])).toEqual([good]);
+    expect(readCandidates([])).toEqual([]);
+  });
+
+  it.each([
+    ["not a list", { mbid: ID }],
+    ["a hit with a bad ID", [{ ...good, mbid: "x" }]],
+    ["a hit with a score out of range", [{ ...good, score: 101 }]],
+    ["a hit with no name", [{ ...good, name: undefined }]],
+    ["credits that are not a list", [{ ...good, credits: "x" }]],
+    ["a credit with a bad ID", [{ ...good, credits: [{ mbid: "x", name: "n" }] }]],
+    ["an old whole-body cache entry", { recordings: [] }],
+  ])("throws on %s", (_name, value) => {
+    expect(() => readCandidates(value)).toThrow(UserError);
   });
 });
 
 describe("decide", () => {
-  const candidate = (score: number) => ({ mbid: ID, score, name: "SYNTH A", credits: [] });
+  const track: Context = { kind: "track", key: "k", name: "SYNTH T", artist: "SYNTH  Artist A", album: "SYNTH B" };
+  const hit = (score: number, overrides: Partial<Candidate> = {}): Candidate => ({
+    mbid: ID,
+    score,
+    name: "SYNTH T",
+    credits: [{ mbid: ARTIST_ID, name: "synth artist a" }],
+    ...overrides,
+  });
 
   it("accepts a score at the threshold and refuses one just under it", () => {
-    expect(decide(candidate(MATCH_MIN_SCORE))).toMatchObject({ state: "resolved", mbid: ID });
-    expect(decide(candidate(MATCH_MIN_SCORE - 1))).toEqual({
+    expect(decide([hit(MATCH_MIN_SCORE)], track)).toMatchObject({ state: "resolved", mbid: ID, score: MATCH_MIN_SCORE });
+    expect(decide([hit(MATCH_MIN_SCORE - 1)], track)).toEqual({
       state: "unresolved",
       reason: "below_threshold",
       score: MATCH_MIN_SCORE - 1,
-      name: "SYNTH A",
+      name: "SYNTH T",
     });
   });
 
-  it("calls no hit no_match", () => {
-    expect(decide(null)).toEqual({ state: "unresolved", reason: "no_match", score: null, name: null });
+  it("compares the raw score with the threshold, so 89.6 is under 90", () => {
+    expect(decide([hit(89.6)], track)).toMatchObject({ state: "unresolved", reason: "below_threshold" });
+    expect(decide([hit(90)], track)).toMatchObject({ state: "resolved" });
+  });
+
+  it("calls an empty list no_match", () => {
+    expect(decide([], track)).toEqual({ state: "unresolved", reason: "no_match", score: null, name: null });
+  });
+
+  it("accepts a hit only when an artist credit, normalized like a source key, equals the play's artist", () => {
+    expect(decide([hit(100)], track)).toMatchObject({ state: "resolved" });
+    const wrong = hit(100, { credits: [{ mbid: OTHER, name: "SYNTH Someone Else" }] });
+    expect(decide([wrong], track)).toMatchObject({ state: "unresolved", reason: "no_match", score: 100, name: "SYNTH T" });
+    const none = hit(100, { credits: [] });
+    expect(decide([none], track)).toMatchObject({ state: "unresolved", reason: "no_match" });
+  });
+
+  it("accepts a hit whose credit is the artist already matched, whatever name it carries", () => {
+    const renamed = hit(100, { credits: [{ mbid: ARTIST_ID, name: "SYNTH Artist A (stylized)" }] });
+    expect(decide([renamed], track)).toMatchObject({ state: "unresolved", reason: "no_match" });
+    expect(decide([renamed], track, ARTIST_ID)).toMatchObject({ state: "resolved", mbid: ID });
+  });
+
+  it("skips a wrong-artist hit and takes the right one behind it", () => {
+    const wrong = hit(100, { mbid: OTHER, credits: [{ mbid: OTHER, name: "SYNTH Someone Else" }] });
+    expect(decide([wrong, hit(95)], track)).toMatchObject({ state: "resolved", mbid: ID, score: 95 });
+  });
+
+  it("is ambiguous when two different MusicBrainz IDs both score at or above the threshold", () => {
+    const decision = decide([hit(100), hit(MATCH_MIN_SCORE, { mbid: OTHER })], track);
+    expect(decision).toEqual({ state: "unresolved", reason: "ambiguous", score: 100, name: "SYNTH T" });
+  });
+
+  it("is not ambiguous when the second hit is under the threshold, or is the same ID again", () => {
+    expect(decide([hit(100), hit(MATCH_MIN_SCORE - 1, { mbid: OTHER })], track)).toMatchObject({ state: "resolved" });
+    expect(decide([hit(100), hit(100)], track)).toMatchObject({ state: "resolved" });
+  });
+
+  it("does not check credits for an artist search, and an artist search can be ambiguous", () => {
+    const artist: Context = { kind: "artist", key: "fred", name: "Fred" };
+    const fred = (mbid: string, score: number): Candidate => ({ mbid, score, name: "Fred", credits: [] });
+    expect(decide([fred(ID, 100)], artist)).toMatchObject({ state: "resolved" });
+    expect(decide([fred(ID, 100), fred(OTHER, 100)], artist)).toMatchObject({ state: "unresolved", reason: "ambiguous" });
+  });
+
+  it("carries the credits of the accepted hit, so an artist can be settled from them", () => {
+    const decision = decide([hit(100)], track);
+    expect(decision.state === "resolved" && decision.credits).toEqual([{ mbid: ARTIST_ID, name: "synth artist a" }]);
   });
 });

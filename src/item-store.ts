@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { UserError } from "./files.ts";
 import type { Cache } from "./musicbrainz.ts";
-import type { Context, Kind } from "./matching.ts";
-import { BATCH_SIZE, PAGE_SIZE } from "./settings.ts";
+import type { Candidate, Context, Kind } from "./matching.ts";
+import { stripNul } from "./names.ts";
+import { BATCH_SIZE, MB_CACHE_MAX_AGE_MS, PAGE_SIZE } from "./settings.ts";
 import { printableCode } from "./store.ts";
 
 type DbError = { code?: unknown } | null;
@@ -14,25 +16,53 @@ function refused(what: string, error: NonNullable<DbError>): UserError {
   );
 }
 
-/** The cache table, `mb_cache`: the JSON answer to each MusicBrainz request, by request. */
-export class SupabaseCache implements Cache {
-  constructor(private readonly client: SupabaseClient) {}
+/** The SHA-256 of a request URL, in lower-case hex. It is the cache key, so a long name cannot overflow an index row. */
+export const requestHash = (url: string): string => createHash("sha256").update(url).digest("hex");
 
-  async get(key: string): Promise<unknown> {
-    const { data, error } = await this.client.from("mb_cache").select("response").eq("query", key).maybeSingle();
+/**
+ * The cache table, `mb_cache`: the parsed candidates of each MusicBrainz request, by the hash of its URL.
+ * A row older than MB_CACHE_MAX_AGE_MS, measured from fetched_at, reads as a miss, and the next put replaces it.
+ */
+export class SupabaseCache implements Cache {
+  constructor(
+    private readonly client: SupabaseClient,
+    private readonly maxAgeMs: number = MB_CACHE_MAX_AGE_MS,
+  ) {}
+
+  async get(url: string): Promise<unknown> {
+    const { data, error } = await this.client
+      .from("mb_cache")
+      .select("candidates, fetched_at")
+      .eq("request_hash", requestHash(url))
+      .maybeSingle();
     if (error) throw refused("a cache read", error);
-    return data === null ? undefined : (data as { response: unknown }).response;
+    if (data === null) return undefined;
+    const row = data as { candidates: unknown; fetched_at: string };
+    if (Date.now() - new Date(row.fetched_at).getTime() > this.maxAgeMs) return undefined;
+    return row.candidates;
   }
 
-  async put(key: string, body: unknown): Promise<void> {
+  async put(url: string, candidates: Candidate[]): Promise<void> {
     const { error } = await this.client
       .from("mb_cache")
-      .upsert({ query: key, response: body, fetched_at: new Date().toISOString() }, { onConflict: "query" });
+      .upsert({ request_hash: requestHash(url), candidates, fetched_at: new Date().toISOString() }, { onConflict: "request_hash" });
     if (error) throw refused("a cache write", error);
+  }
+
+  async remove(url: string): Promise<void> {
+    const { error } = await this.client.from("mb_cache").delete().eq("request_hash", requestHash(url));
+    if (error) throw refused("a cache delete", error);
   }
 }
 
-export type StoredItem = { id: number; kind: Kind; source_key: string; state: "pending" | "resolved" | "unresolved" };
+export type StoredItem = {
+  id: number;
+  kind: Kind;
+  source_key: string;
+  state: "pending" | "resolved" | "unresolved";
+  mbid: string | null;
+  attempts: number;
+};
 
 /** Every stored item, a page at a time. */
 export async function loadItems(client: SupabaseClient): Promise<StoredItem[]> {
@@ -41,7 +71,7 @@ export async function loadItems(client: SupabaseClient): Promise<StoredItem[]> {
   for (;;) {
     const { data, error } = await client
       .from("items")
-      .select("id, kind, source_key, state")
+      .select("id, kind, source_key, state, mbid, attempts")
       .gt("id", after)
       .order("id")
       .limit(PAGE_SIZE);
@@ -63,8 +93,8 @@ export async function insertPending(client: SupabaseClient, contexts: Context[])
   for (let start = 0; start < contexts.length; start += BATCH_SIZE) {
     const rows = contexts.slice(start, start + BATCH_SIZE).map((context) => ({
       kind: context.kind,
-      source_key: context.key,
-      name: context.name,
+      source_key: stripNul(context.key),
+      name: stripNul(context.name),
       spotify_uri: context.uri ?? null,
     }));
     const { data, error } = await client
@@ -78,8 +108,13 @@ export async function insertPending(client: SupabaseClient, contexts: Context[])
 }
 
 export type Settlement =
-  | { state: "resolved"; mbid: string; score: number; name: string }
-  | { state: "unresolved"; reason: "no_match" | "below_threshold" | "empty_name"; score: number | null; name: string | null };
+  | { state: "resolved"; mbid: string; score: number | null; name: string; reason?: "credit" }
+  | {
+      state: "unresolved";
+      reason: "no_match" | "below_threshold" | "ambiguous" | "empty_name" | "no_artist" | "bad_query" | "name_too_long";
+      score: number | null;
+      name: string | null;
+    };
 
 /** Postgres code for a unique index that would be broken. */
 const UNIQUE_VIOLATION = "23505";
@@ -97,10 +132,16 @@ export async function settle(
   settlement: Settlement,
 ): Promise<boolean> {
   const resolved_at = new Date().toISOString();
-  const common = { resolved_at, match_score: settlement.score, matched_name: settlement.name };
+  // MusicBrainz scores are whole numbers in practice. The column holds whole numbers, so a fraction is rounded to store.
+  // The comparison with the threshold has already been made on the raw score.
+  const common = {
+    resolved_at,
+    match_score: settlement.score === null ? null : Math.round(settlement.score),
+    matched_name: settlement.name === null ? null : stripNul(settlement.name),
+  };
   const patch =
     settlement.state === "resolved"
-      ? { ...common, state: "resolved", mbid: settlement.mbid, reason: null }
+      ? { ...common, state: "resolved", mbid: settlement.mbid, reason: settlement.reason ?? null }
       : { ...common, state: "unresolved", reason: settlement.reason };
 
   const attempt = async (values: Record<string, unknown>) =>
@@ -117,7 +158,20 @@ export async function settle(
   if (owner.data === null) throw new UserError("An item's MusicBrainz ID is held by a row that then vanished. Run the command again.");
   const ownerId = (owner.data as { id: number }).id;
 
-  const merged = await attempt({ ...common, state: "resolved", mbid: null, merged_into: ownerId, reason: null });
+  const merged = await attempt({ ...common, state: "resolved", mbid: null, merged_into: ownerId, reason: settlement.reason ?? null });
   if (merged.error) throw refused("an item update", merged.error);
   return merged.data.length > 0;
+}
+
+/**
+ * Records that a try ended with MusicBrainz unavailable. `attempts` is what this run read, plus one.
+ * Only one run works at a time (see job-lock.ts), so no other run can move the count between the read and this write.
+ */
+export async function recordAttempt(client: SupabaseClient, item: { id: number; attempts: number }): Promise<void> {
+  const { error } = await client
+    .from("items")
+    .update({ attempts: item.attempts + 1, last_attempt_at: new Date().toISOString() })
+    .eq("id", item.id)
+    .eq("state", "pending");
+  if (error) throw refused("an item update", error);
 }

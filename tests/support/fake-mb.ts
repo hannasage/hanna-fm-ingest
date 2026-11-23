@@ -1,7 +1,10 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 
-/** One request the fake MusicBrainz server saw. `at` is the wall-clock time, in milliseconds, it arrived. */
+/**
+ * One request the fake MusicBrainz server saw. `at` is when it arrived, in milliseconds, read from
+ * the monotonic clock `performance.now()` with its fraction. Every gap is measured on that one clock.
+ */
 export type Seen = {
   at: number;
   /** The path without the query, for example "/ws/2/recording". */
@@ -23,7 +26,7 @@ export type FakeMb = {
   /** The address to give the command as MB_API_BASE. */
   base: string;
   seen: Seen[];
-  /** Gaps between the arrival of each request and the one before, in milliseconds. */
+  /** Gaps between the arrival of each request and the one before, in milliseconds, with their fraction. */
   gaps: () => number[];
   close: () => Promise<void>;
 };
@@ -50,7 +53,7 @@ export async function startFakeMb(respond: (request: Seen, count: number) => Rep
   const server: Server = createServer((request, response) => {
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     const entry: Seen = {
-      at: Date.now(),
+      at: performance.now(),
       path: url.pathname,
       fields: parseFields(url.searchParams.get("query") ?? ""),
       params: url.searchParams,
@@ -76,29 +79,40 @@ export async function startFakeMb(respond: (request: Seen, count: number) => Rep
   };
 }
 
-/** A synthetic MusicBrainz answer for each search type. Every ID here is made up. */
+/**
+ * A synthetic MusicBrainz answer for each search type. Every ID here is made up.
+ * The shape is the one on the MusicBrainz search page: an artist credit is `{ artist: { id, name, sort-name } }`.
+ * `hits` may hold several results, best first, so a test can ask for an ambiguous answer.
+ */
+type Credit = { id: string; name: string };
 export const answer = {
-  recording: (hit: { id: string; score: number; title: string; artists: { id: string; name: string }[] }) => ({
-    count: 1,
+  recording: (...hits: { id: string; score: number; title: string; artists: Credit[] }[]) => ({
+    created: "2026-01-01T00:00:00.000Z",
+    count: hits.length,
     offset: 0,
-    recordings: [
-      {
-        id: hit.id,
-        score: String(hit.score),
-        title: hit.title,
-        "artist-credit": hit.artists.map((artist) => ({ name: artist.name, artist })),
-      },
-    ],
+    recordings: hits.map((hit) => ({
+      id: hit.id,
+      score: String(hit.score),
+      title: hit.title,
+      "artist-credit": hit.artists.map((artist) => ({ artist: { id: artist.id, name: artist.name, "sort-name": artist.name } })),
+    })),
   }),
-  releaseGroup: (hit: { id: string; score: number; title: string }) => ({
-    count: 1,
+  releaseGroup: (...hits: { id: string; score: number; title: string; artists?: Credit[] }[]) => ({
+    created: "2026-01-01T00:00:00.000Z",
+    count: hits.length,
     offset: 0,
-    "release-groups": [{ id: hit.id, score: String(hit.score), title: hit.title }],
+    "release-groups": hits.map((hit) => ({
+      id: hit.id,
+      score: String(hit.score),
+      title: hit.title,
+      "artist-credit": (hit.artists ?? []).map((artist) => ({ artist: { id: artist.id, name: artist.name, "sort-name": artist.name } })),
+    })),
   }),
-  artist: (hit: { id: string; score: number; name: string }) => ({
-    count: 1,
+  artist: (...hits: { id: string; score: number; name: string }[]) => ({
+    created: "2026-01-01T00:00:00.000Z",
+    count: hits.length,
     offset: 0,
-    artists: [{ id: hit.id, score: String(hit.score), name: hit.name }],
+    artists: hits.map((hit) => ({ id: hit.id, score: String(hit.score), name: hit.name, "sort-name": hit.name })),
   }),
   /** No match: MusicBrainz answers 200 with an empty list. */
   empty: (listName: "recordings" | "release-groups" | "artists") => ({ count: 0, offset: 0, [listName]: [] }),

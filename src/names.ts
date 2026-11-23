@@ -21,3 +21,8 @@ export function albumKey(album: string, artist: string): string {
 export function escapePhrase(text: string): string {
   return text.replace(/[\\"]/g, "\\$&");
 }
+
+/** The database cannot store a NUL character in text, so none is kept anywhere. */
+export function stripNul(text: string): string {
+  return text.replaceAll("\u0000", "");
+}

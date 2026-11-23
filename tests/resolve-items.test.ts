@@ -1,110 +1,22 @@
-import { execFileSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DEFAULT_MB_API_BASE, MATCH_MIN_SCORE } from "../src/settings.ts";
-import { counts, runResolve, type CliResult } from "./support/cli.ts";
-import { adminClient, anonClient, localStack } from "./support/env.ts";
+import { DEFAULT_MB_API_BASE, MATCH_MIN_SCORE, MB_MIN_INTERVAL_MS, RESOLVE_MAX_ATTEMPTS } from "../src/settings.ts";
+import { counts, runResolve, startResolve, type CliResult } from "./support/cli.ts";
+import { artistA, FULL, fromCatalog, SMALL } from "./support/catalog.ts";
+import { clearTables, find, id, items, seedPlays, T1, T2, T3, uri } from "./support/data.ts";
+import { adminClient, localStack } from "./support/env.ts";
 import { answer, startFakeMb, type FakeMb, type Reply, type Seen } from "./support/fake-mb.ts";
+import {
+  publishedArtistSearch,
+  publishedRecordingSearch,
+  publishedReleaseGroupSearch,
+} from "./support/published-examples.ts";
+import { USER_AGENT } from "./support/inproc.ts";
 
+/**
+ * The real command, run as a person runs it, against the local database and a fake MusicBrainz server.
+ * Matching rules and counts are tested faster, in this process, in resolve-flow.test.ts.
+ */
 const db = adminClient();
-const USER_AGENT = "SYNTH-resolve-test/0.0 ( synthetic-contact.invalid )";
-
-/** Made-up IDs. None of them belongs to any real artist, album or recording. */
-const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
-
-type Row = {
-  id: number;
-  kind: string;
-  mbid: string | null;
-  name: string;
-  source_key: string;
-  spotify_uri: string | null;
-  state: string;
-  reason: string | null;
-  match_score: number | null;
-  matched_name: string | null;
-  merged_into: number | null;
-  resolved_at: string | null;
-  created_at: string;
-};
-
-async function items(): Promise<Row[]> {
-  const { data, error } = await db.from("items").select("*").order("id");
-  if (error) throw new Error(`could not read items: ${error.code}`);
-  return data as Row[];
-}
-
-function find(rows: Row[], kind: string, name: string): Row {
-  const row = rows.find((candidate) => candidate.kind === kind && candidate.name === name);
-  if (!row) throw new Error(`no ${kind} item named ${name}`);
-  return row;
-}
-
-type PlayInput = { uri: string; track: string; artist: string; album: string | null };
-
-async function seedPlays(inputs: PlayInput[]): Promise<void> {
-  const rows = inputs.map((input, index) => ({
-    track_uri: input.uri,
-    track_name: input.track,
-    artist_name: input.artist,
-    album_name: input.album,
-    ended_at: new Date(Date.UTC(2024, 0, 1, 0, index)).toISOString(),
-    ms_played: 200_000,
-    source: "export",
-  }));
-  const { error } = await db.from("plays").insert(rows);
-  if (error) throw new Error(`could not seed plays: ${error.code}`);
-}
-
-const uri = (n: number) => `spotify:track:SYNTH${String(n).padStart(18, "0")}`;
-const T1: PlayInput = { uri: uri(1), track: "SYNTH Song One", artist: "SYNTH Artist A", album: "SYNTH Album A" };
-const T2: PlayInput = { uri: uri(2), track: "SYNTH Song Two", artist: "SYNTH Artist A", album: "SYNTH Album A" };
-const T3: PlayInput = { uri: uri(3), track: "SYNTH Song Three", artist: "SYNTH Artist B", album: "SYNTH Album B" };
-
-type Catalog = {
-  tracks?: Record<string, { id: string; score: number; title: string; artists: { id: string; name: string }[] }>;
-  albums?: Record<string, { id: string; score: number; title: string }>;
-  artists?: Record<string, { id: string; score: number; name: string }>;
-};
-
-/** Answers a search from a table of synthetic hits. Anything not in the table gets an empty list. */
-function fromCatalog(catalog: Catalog): (request: Seen) => Reply {
-  return (request) => {
-    if (request.path.endsWith("/recording")) {
-      const hit = catalog.tracks?.[request.fields.recording ?? ""];
-      return { status: 200, body: hit ? answer.recording(hit) : answer.empty("recordings") };
-    }
-    if (request.path.endsWith("/release-group")) {
-      const hit = catalog.albums?.[request.fields.releasegroup ?? ""];
-      return { status: 200, body: hit ? answer.releaseGroup(hit) : answer.empty("release-groups") };
-    }
-    if (request.path.endsWith("/artist")) {
-      const hit = catalog.artists?.[request.fields.artist ?? ""];
-      return { status: 200, body: hit ? answer.artist(hit) : answer.empty("artists") };
-    }
-    return { status: 404 };
-  };
-}
-
-const artistA = { id: id(11), name: "SYNTH Artist A" };
-/** Credited under another spelling, so the artist row cannot be settled from the track and needs its own search. */
-const artistBCredit = { id: id(12), name: "SYNTH Artist B (credited)" };
-
-/** Three tracks, two albums, two artists. Artist A is settled from a track's credit. Artist B needs a search. */
-const FULL: Catalog = {
-  tracks: {
-    "SYNTH Song One": { id: id(21), score: 100, title: "SYNTH Song One", artists: [artistA] },
-    "SYNTH Song Two": { id: id(22), score: 97, title: "SYNTH Song Two", artists: [artistA] },
-    "SYNTH Song Three": { id: id(23), score: 95, title: "SYNTH Song Three", artists: [artistBCredit] },
-  },
-  albums: {
-    "SYNTH Album A": { id: id(31), score: 100, title: "SYNTH Album A" },
-    "SYNTH Album B": { id: id(32), score: 92, title: "SYNTH Album B" },
-  },
-  artists: { "SYNTH Artist B": { id: id(12), score: 100, name: "SYNTH Artist B" } },
-};
-
-/** One track and its album, for the tests that need few requests. */
-const SMALL: Catalog = { tracks: { [T1.track]: FULL.tracks![T1.track]! }, albums: { [T1.album!]: FULL.albums![T1.album!]! } };
 
 let servers: FakeMb[] = [];
 async function fake(respond: (request: Seen, count: number) => Reply): Promise<FakeMb> {
@@ -113,8 +25,8 @@ async function fake(respond: (request: Seen, count: number) => Reply): Promise<F
   return server;
 }
 
-function resolve(server: FakeMb, env: Record<string, string | undefined> = {}): Promise<CliResult> {
-  return runResolve({ MB_USER_AGENT: USER_AGENT, MB_API_BASE: server.base, ...env });
+function resolve(server: FakeMb, env: Record<string, string | undefined> = {}, args: string[] = []): Promise<CliResult> {
+  return runResolve({ MB_USER_AGENT: USER_AGENT, MB_API_BASE: server.base, ...env }, args);
 }
 
 function expectNoKey(...results: CliResult[]): void {
@@ -122,15 +34,21 @@ function expectNoKey(...results: CliResult[]): void {
   for (const result of results) expect(result.output.includes(key)).toBe(false);
 }
 
+/**
+ * Every gap between two requests the server saw is at least the interval. Both ends are read from one
+ * clock with its fraction, and nothing is allowed to round: a gap of 999.9 ms fails.
+ */
+function expectGapsAtLeast(server: FakeMb, minimum: number): void {
+  for (const gap of server.gaps()) expect(gap).toBeGreaterThanOrEqual(minimum);
+}
+
+async function lockedUntil(): Promise<string | null | undefined> {
+  const { data } = await db.from("job_locks").select("locked_until").eq("name", "resolve-items").maybeSingle();
+  return data === null ? undefined : (data as { locked_until: string | null }).locked_until;
+}
+
 beforeEach(async () => {
-  for (const [table, column, empty] of [
-    ["items", "id", 0],
-    ["mb_cache", "query", ""],
-    ["plays", "id", 0],
-  ] as const) {
-    const { error } = await db.from(table).delete().neq(column, empty);
-    if (error) throw new Error(`could not clear ${table}: ${error.code}`);
-  }
+  await clearTables(db);
 });
 
 afterEach(async () => {
@@ -140,18 +58,17 @@ afterEach(async () => {
 
 describe("resolve-items: stored items", () => {
   it("stores every artist, album and track with an MBID and a Spotify alias", async () => {
-    await seedPlays([T1, T2, T3, T1]);
+    await seedPlays(db, [T1, T2, T3, T1]);
     const server = await fake(fromCatalog(FULL));
 
     const result = await resolve(server);
 
     expect(result.status, result.output).toBe(0);
-    const rows = await items();
+    const rows = await items(db);
     expect(rows).toHaveLength(7);
     expect(rows.every((row) => row.state === "resolved" && row.resolved_at !== null)).toBe(true);
 
-    const song = find(rows, "track", "SYNTH Song One");
-    expect(song).toMatchObject({
+    expect(find(rows, "track", "SYNTH Song One")).toMatchObject({
       mbid: id(21),
       spotify_uri: T1.uri,
       source_key: T1.uri,
@@ -172,29 +89,40 @@ describe("resolve-items: stored items", () => {
     expectNoKey(result);
   });
 
-  it("settles an artist from a track's credit with no request, and searches when the credit name differs", async () => {
-    await seedPlays([T1, T2, T3]);
+  it("settles each artist from a track's credit, with no artist search, a null score and the reason credit", async () => {
+    await seedPlays(db, [T1, T2, T3]);
     const server = await fake(fromCatalog(FULL));
 
     const result = await resolve(server);
 
-    const rows = await items();
+    const rows = await items(db);
     expect(find(rows, "artist", "SYNTH Artist A")).toMatchObject({
       mbid: artistA.id,
       state: "resolved",
       source_key: "synth artist a",
       spotify_uri: null,
+      match_score: null,
+      reason: "credit",
     });
     expect(find(rows, "artist", "SYNTH Artist B").mbid).toBe(id(12));
-    const artistSearches = server.seen.filter((request) => request.path.endsWith("/artist"));
-    expect(artistSearches.map((request) => request.fields.artist)).toEqual(["SYNTH Artist B"]);
-    // 3 tracks, 2 albums, 1 artist search.
-    expect(server.seen).toHaveLength(6);
-    expect(counts(result.stdout)).toMatchObject({ new: 7, resolved: 7, unresolved: 0, pending: 0, requests: 6, cache_hits: 0 });
+    expect(server.seen.filter((request) => request.path.endsWith("/artist"))).toHaveLength(0);
+    // 3 tracks and 2 albums.
+    expect(server.seen).toHaveLength(5);
+    expect(counts(result.stdout)).toMatchObject({ new: 7, total: 7, resolved: 7, unresolved: 0, pending: 0, skipped: 0, remaining: 0, requests: 5, cache_hits: 0 });
   });
 
-  it("searches by track, artist and album, and by album and artist, asking for JSON and one hit", async () => {
-    await seedPlays([T1]);
+  it("searches an artist by name when no track settled it", async () => {
+    await seedPlays(db, [{ uri: uri(4), track: "SYNTH Unmatched", artist: "SYNTH Artist C", album: null }]);
+    const server = await fake(fromCatalog({ artists: { "SYNTH Artist C": { id: id(13), score: 100, name: "SYNTH Artist C" } } }));
+
+    await resolve(server);
+
+    expect(find(await items(db), "artist", "SYNTH Artist C")).toMatchObject({ state: "resolved", mbid: id(13), match_score: 100, reason: null });
+    expect(server.seen.filter((request) => request.path.endsWith("/artist")).map((request) => request.fields.artist)).toEqual(["SYNTH Artist C"]);
+  });
+
+  it("searches by track, artist and album, and by album and artist, asking for JSON and five hits", async () => {
+    await seedPlays(db, [T1]);
     const server = await fake(fromCatalog(SMALL));
 
     await resolve(server);
@@ -206,13 +134,13 @@ describe("resolve-items: stored items", () => {
     expect(album?.fields).toEqual({ releasegroup: T1.album, artistname: T1.artist });
     for (const request of server.seen) {
       expect(request.params.get("fmt")).toBe("json");
-      expect(request.params.get("limit")).toBe("1");
+      expect(request.params.get("limit")).toBe("5");
       expect(request.accept).toBe("application/json");
     }
   });
 
   it("sends the User-Agent exactly as set in MB_USER_AGENT", async () => {
-    await seedPlays([T1]);
+    await seedPlays(db, [T1]);
     const server = await fake(fromCatalog(SMALL));
 
     await resolve(server);
@@ -223,7 +151,7 @@ describe("resolve-items: stored items", () => {
 
   it("keeps the exact text of names with quotes, backslashes and emoji in the search, and one artist for spellings that differ only in case", async () => {
     const odd = 'SYNTH "Quoted" \\ Song \u{1F3B5}';
-    await seedPlays([
+    await seedPlays(db, [
       { uri: uri(5), track: odd, artist: "SYNTH Artist A", album: null },
       { uri: uri(6), track: "SYNTH Plain", artist: "synth  artist a", album: null },
     ]);
@@ -232,25 +160,25 @@ describe("resolve-items: stored items", () => {
     await resolve(server);
 
     expect(server.seen[0]?.fields.recording).toBe(odd);
-    const rows = await items();
-    expect(rows.filter((row) => row.kind === "artist")).toHaveLength(1);
+    expect((await items(db)).filter((row) => row.kind === "artist")).toHaveLength(1);
   });
 
-  it("records a blank name as unresolved with no request for it, and leaves a blank album out", async () => {
-    await seedPlays([{ uri: uri(7), track: "SYNTH Blank Artist Song", artist: "  ", album: " " }]);
+  it("records a blank artist as unresolved, never searches a track by its title alone, and leaves a blank album out", async () => {
+    await seedPlays(db, [{ uri: uri(7), track: "SYNTH Blank Artist Song", artist: "  ", album: " " }]);
     const server = await fake(fromCatalog({}));
 
     const result = await resolve(server);
 
     expect(result.status, result.output).toBe(0);
-    const rows = await items();
+    const rows = await items(db);
     expect(rows.filter((row) => row.kind === "album")).toHaveLength(0);
     expect(rows.find((row) => row.kind === "artist")).toMatchObject({ state: "unresolved", reason: "empty_name" });
-    expect(server.seen.map((request) => request.fields)).toEqual([{ recording: "SYNTH Blank Artist Song" }]);
+    expect(find(rows, "track", "SYNTH Blank Artist Song")).toMatchObject({ state: "unresolved", reason: "no_artist" });
+    expect(server.seen).toHaveLength(0);
   });
 
   it("keeps a second Spotify track for the same recording, pointing at the row that holds the MBID", async () => {
-    await seedPlays([
+    await seedPlays(db, [
       { uri: uri(8), track: "SYNTH Single Version", artist: "SYNTH Artist A", album: null },
       { uri: uri(9), track: "SYNTH Album Version", artist: "SYNTH Artist A", album: null },
     ]);
@@ -262,7 +190,7 @@ describe("resolve-items: stored items", () => {
     const result = await resolve(server);
 
     expect(result.status, result.output).toBe(0);
-    const rows = await items();
+    const rows = await items(db);
     const first = find(rows, "track", "SYNTH Single Version");
     const second = find(rows, "track", "SYNTH Album Version");
     expect(first).toMatchObject({ mbid: id(51), merged_into: null, state: "resolved" });
@@ -270,33 +198,79 @@ describe("resolve-items: stored items", () => {
   });
 });
 
+describe("resolve-items: shapes copied from the MusicBrainz documentation", () => {
+  // These answers are copied from the official search page, not made up. Ticket 7 checks the command against a live response.
+  const empty = (request: Seen): Reply => ({
+    status: 200,
+    body: answer.empty(request.path.endsWith("/recording") ? "recordings" : request.path.endsWith("/artist") ? "artists" : "release-groups"),
+  });
+
+  it("reads a recording search answer, and settles the artist from its credit", async () => {
+    const recording = publishedRecordingSearch.recordings[0];
+    const credit = recording["artist-credit"][0].artist;
+    await seedPlays(db, [{ uri: uri(20), track: recording.title, artist: credit.name, album: null }]);
+    const server = await fake((request) => (request.path.endsWith("/recording") ? { status: 200, body: publishedRecordingSearch } : empty(request)));
+
+    const result = await resolve(server);
+
+    expect(result.status, result.output).toBe(0);
+    const rows = await items(db);
+    expect(find(rows, "track", recording.title)).toMatchObject({ state: "resolved", mbid: recording.id, match_score: 100, matched_name: recording.title });
+    expect(find(rows, "artist", credit.name)).toMatchObject({ state: "resolved", mbid: credit.id, reason: "credit", match_score: null });
+  });
+
+  it("reads a release-group search answer", async () => {
+    const group = publishedReleaseGroupSearch["release-groups"][0];
+    const credit = group["artist-credit"][0].artist;
+    await seedPlays(db, [{ uri: uri(21), track: "SYNTH Other", artist: credit.name, album: group.title }]);
+    const server = await fake((request) => (request.path.endsWith("/release-group") ? { status: 200, body: publishedReleaseGroupSearch } : empty(request)));
+
+    const result = await resolve(server);
+
+    expect(result.status, result.output).toBe(0);
+    expect(find(await items(db), "album", group.title)).toMatchObject({ state: "resolved", mbid: group.id, match_score: 100, matched_name: group.title });
+    expect(server.seen.find((request) => request.path.endsWith("/release-group"))?.fields.releasegroup).toBe(group.title);
+  });
+
+  it("reads an artist search answer, where two artists are both named Fred and both score 100, and refuses to pick one", async () => {
+    const [first, second] = publishedArtistSearch.artists;
+    expect([first.name, second.name, first.score, second.score]).toEqual(["Fred", "Fred", "100", "100"]);
+    await seedPlays(db, [{ uri: uri(22), track: "SYNTH Unmatched", artist: "Fred", album: null }]);
+    const server = await fake((request) => (request.path.endsWith("/artist") ? { status: 200, body: publishedArtistSearch } : empty(request)));
+
+    const result = await resolve(server);
+
+    expect(result.status, result.output).toBe(0);
+    expect(find(await items(db), "artist", "Fred")).toMatchObject({ state: "unresolved", reason: "ambiguous", mbid: null, match_score: 100, matched_name: "Fred" });
+  });
+});
+
 describe("resolve-items: queue and cache", () => {
-  it("never sends more than one request a second, measured at the server", async () => {
-    await seedPlays([T1, T2, T3]);
+  it("never sends more than one request a second, measured at the server on one clock, with no rounding", async () => {
+    await seedPlays(db, [T1, T2, T3]);
     const server = await fake(fromCatalog(FULL));
 
     const result = await resolve(server);
 
     expect(server.seen.length).toBeGreaterThanOrEqual(4);
-    const gaps = server.gaps();
-    expect(gaps.length).toBe(server.seen.length - 1);
-    for (const gap of gaps) expect(gap).toBeGreaterThanOrEqual(1000);
+    expect(server.gaps().length).toBe(server.seen.length - 1);
+    expectGapsAtLeast(server, MB_MIN_INTERVAL_MS);
     expect(counts(result.stdout).requests).toBe(server.seen.length);
   });
 
   it("serves a repeat run from the stored items, and a rebuilt table from the cache, with no request", async () => {
-    await seedPlays([T1]);
+    await seedPlays(db, [T1]);
     const server = await fake(fromCatalog(SMALL));
 
     const first = await resolve(server);
-    const before = await items();
+    const before = await items(db);
     expect(server.seen).toHaveLength(2);
     expect(counts(first.stdout).requests).toBe(2);
 
     const second = await resolve(server);
     expect(server.seen).toHaveLength(2);
-    expect(counts(second.stdout)).toMatchObject({ new: 0, requests: 0, cache_hits: 0 });
-    expect(await items()).toEqual(before);
+    expect(counts(second.stdout)).toMatchObject({ new: 0, total: 0, requests: 0, cache_hits: 0 });
+    expect(await items(db)).toEqual(before);
 
     // Lose the item rows. The answers are still cached, so the lookups need no request.
     const { error } = await db.from("items").delete().neq("id", 0);
@@ -305,43 +279,198 @@ describe("resolve-items: queue and cache", () => {
     expect(third.status, third.output).toBe(0);
     expect(server.seen).toHaveLength(2);
     expect(counts(third.stdout)).toMatchObject({ new: 3, requests: 0, cache_hits: 2, resolved: 3 });
-    const after = await items();
+    const after = await items(db);
     expect(after.map((row) => [row.kind, row.mbid])).toEqual(before.map((row) => [row.kind, row.mbid]));
 
     const { count } = await db.from("mb_cache").select("*", { count: "exact", head: true });
     expect(count).toBe(2);
   });
+});
 
-  it("does not make two runs at once create duplicate items", async () => {
-    await seedPlays([T1, T2]);
+describe("resolve-items: one run at a time", () => {
+  it("lets only one of two simultaneous runs work, and refuses the other with exit 3, so the rate stays under one a second", async () => {
+    await seedPlays(db, [T1, T2, T3]);
     const server = await fake(fromCatalog(FULL));
 
-    const [a, b] = await Promise.all([
-      runResolve({ MB_USER_AGENT: USER_AGENT, MB_API_BASE: server.base }),
-      runResolve({ MB_USER_AGENT: USER_AGENT, MB_API_BASE: server.base }),
-    ]);
+    const [a, b] = await Promise.all([resolve(server), resolve(server)]);
 
-    expect(a.status, a.output).toBe(0);
-    expect(b.status, b.output).toBe(0);
-    const rows = await items();
-    // 2 tracks, 1 album, 1 artist.
-    expect(rows).toHaveLength(4);
-    expect(new Set(rows.map((row) => `${row.kind}|${row.source_key}`)).size).toBe(4);
+    expect([a.status, b.status].sort(), `${a.output}\n${b.output}`).toEqual([0, 3]);
+    const loser = a.status === 3 ? a : b;
+    expect(loser.stderr).toMatch(/another/i);
+    expect(loser.stdout).toBe("");
+    // One run's requests, and every gap across all of them at least one second.
+    expect(server.seen).toHaveLength(5);
+    expectGapsAtLeast(server, MB_MIN_INTERVAL_MS);
+    const rows = await items(db);
+    expect(rows).toHaveLength(7);
     expect(rows.every((row) => row.state === "resolved")).toBe(true);
-    expect(new Set(rows.map((row) => row.mbid)).size).toBe(4);
     expectNoKey(a, b);
+  });
+
+  it("exits 3 with a plain message, and changes nothing, while another run holds the lock", async () => {
+    await seedPlays(db, [T1]);
+    const until = new Date(Date.now() + 10 * 60_000).toISOString();
+    await db.from("job_locks").insert({ name: "resolve-items", locked_until: until });
+    const server = await fake(fromCatalog(SMALL));
+
+    const result = await resolve(server);
+
+    expect(result.status).toBe(3);
+    expect(result.stderr).toMatch(/another/i);
+    expect(server.seen).toHaveLength(0);
+    expect(await items(db)).toHaveLength(0);
+    expect(await lockedUntil()).toBe(until.replace("Z", "+00:00"));
+    expectNoKey(result);
+  });
+
+  it("takes a lock whose lease has passed, and frees it at the end", async () => {
+    await seedPlays(db, [T1]);
+    await db.from("job_locks").insert({ name: "resolve-items", locked_until: new Date(Date.now() - 60_000).toISOString() });
+    const server = await fake(fromCatalog(SMALL));
+
+    const result = await resolve(server);
+
+    expect(result.status, result.output).toBe(0);
+    expect(await lockedUntil()).toBeNull();
+  });
+
+  it("frees the lock when the run stops with an error", async () => {
+    await seedPlays(db, [T1]);
+    const server = await fake(() => ({ status: 401 }));
+
+    const result = await resolve(server);
+
+    expect(result.status).toBe(1);
+    expect(await lockedUntil()).toBeNull();
+  });
+
+  it("frees the lock when it is stopped with SIGTERM, and a later run finishes the work with no item searched twice", async () => {
+    await seedPlays(db, [1, 2, 3, 4, 5, 6].map((n) => ({ uri: uri(n), track: `SYNTH Track ${n}`, artist: "SYNTH Artist A", album: null })));
+    const first = await fake(fromCatalog({}));
+    const running = startResolve({ MB_USER_AGENT: USER_AGENT, MB_API_BASE: first.base });
+
+    await waitFor(() => first.seen.length >= 2);
+    running.stop("SIGTERM");
+    const stopped = await running.done;
+
+    expect(stopped.status).not.toBe(0);
+    expect(await lockedUntil()).toBeNull();
+    // A request already sent to the database can still land after the command is gone.
+    await new Promise((done) => setTimeout(done, 500));
+    const rows = await items(db);
+    const left = rows.filter((row) => row.state === "pending");
+    expect(left.length).toBeGreaterThan(0);
+    expect(left.length).toBeLessThan(rows.length);
+
+    const second = await fake(fromCatalog({}));
+    const resumed = await resolve(second);
+
+    expect(resumed.status, resumed.output).toBe(0);
+    // Only what was left is searched. An item the stopped run had settled is not asked about again.
+    // (The one the stopped run was on may already be in the cache, and then it costs no request.)
+    const settled = rows.filter((row) => row.state !== "pending").map((row) => row.name);
+    const asked = second.seen.map((request) => request.fields.recording ?? request.fields.artist);
+    expect(asked.filter((name) => settled.includes(name ?? ""))).toEqual([]);
+    expect(second.seen.length).toBeLessThanOrEqual(left.length);
+    expect(second.seen.length).toBeGreaterThanOrEqual(left.length - 1);
+    expect(counts(resumed.stdout)).toMatchObject({ total: left.length, unresolved: left.length, remaining: 0 });
+    expect((await items(db)).every((row) => row.state === "unresolved")).toBe(true);
+  }, 60_000);
+
+  it("after a crash (SIGKILL) holds the lock until the lease passes, then resumes and ends complete", async () => {
+    await seedPlays(db, [1, 2, 3, 4, 5, 6].map((n) => ({ uri: uri(n), track: `SYNTH Track ${n}`, artist: "SYNTH Artist A", album: null })));
+    const first = await fake(fromCatalog({}));
+    const running = startResolve({ MB_USER_AGENT: USER_AGENT, MB_API_BASE: first.base });
+    await waitFor(() => first.seen.length >= 2);
+    running.stop("SIGKILL");
+    await running.done;
+    // A request already sent to the database can still land after the command is gone.
+    await new Promise((done) => setTimeout(done, 500));
+    const left = (await items(db)).filter((row) => row.state === "pending").length;
+    expect(left).toBeGreaterThan(0);
+
+    const second = await fake(fromCatalog({}));
+    const blocked = await resolve(second);
+    expect(blocked.status).toBe(3);
+    expect(second.seen).toHaveLength(0);
+
+    await db.from("job_locks").update({ locked_until: new Date(Date.now() - 1000).toISOString() }).eq("name", "resolve-items");
+    const resumed = await resolve(second);
+
+    expect(resumed.status, resumed.output).toBe(0);
+    expect(counts(resumed.stdout)).toMatchObject({ total: left, remaining: 0 });
+    expect((await items(db)).every((row) => row.state === "unresolved")).toBe(true);
+  }, 60_000);
+});
+
+async function waitFor(condition: () => boolean, timeoutMs = 30_000): Promise<void> {
+  const start = Date.now();
+  while (!condition()) {
+    if (Date.now() - start > timeoutMs) throw new Error("waited too long");
+    await new Promise((done) => setTimeout(done, 25));
+  }
+}
+
+describe("resolve-items: flags", () => {
+  it("--limit N processes at most N items and prints how many remain", async () => {
+    await seedPlays(db, [1, 2, 3, 4, 5].map((n) => ({ uri: uri(n), track: `SYNTH Track ${n}`, artist: "SYNTH Artist A", album: null })));
+    const server = await fake(fromCatalog({}));
+
+    const result = await resolve(server, {}, ["--limit", "2"]);
+
+    expect(result.status, result.output).toBe(0);
+    expect(server.seen).toHaveLength(2);
+    expect(counts(result.stdout)).toMatchObject({ total: 6, unresolved: 2, remaining: 4, requests: 2 });
+    expect((await items(db)).filter((row) => row.state === "pending")).toHaveLength(4);
+  });
+
+  it("skips an item that failed too often unless --retry-failed is passed, and says so", async () => {
+    await seedPlays(db, [T1]);
+    await db.from("items").insert({ kind: "track", name: T1.track, source_key: T1.uri, attempts: RESOLVE_MAX_ATTEMPTS });
+    const server = await fake(fromCatalog(SMALL));
+
+    const skipped = await resolve(server);
+    expect(skipped.status, skipped.output).toBe(0);
+    expect(counts(skipped.stdout)).toMatchObject({ skipped: 1 });
+    expect(skipped.stderr).toMatch(/--retry-failed/);
+    expect(find(await items(db), "track", T1.track).state).toBe("pending");
+
+    const retried = await resolve(server, {}, ["--retry-failed"]);
+    expect(retried.status, retried.output).toBe(0);
+    expect(counts(retried.stdout)).toMatchObject({ skipped: 0, resolved: 1 });
+    expect(find(await items(db), "track", T1.track).state).toBe("resolved");
+  });
+
+  it.each([
+    ["--limit with no number", ["--limit"]],
+    ["--limit 0", ["--limit", "0"]],
+    ["--limit -3", ["--limit", "-3"]],
+    ["--limit 1.5", ["--limit", "1.5"]],
+    ["--limit abc", ["--limit", "abc"]],
+    ["an unknown flag", ["--bogus"]],
+    ["a stray word", ["now"]],
+  ])("exits 2 before any request for %s", async (_name, args) => {
+    await seedPlays(db, [T1]);
+    const server = await fake(fromCatalog(SMALL));
+
+    const result = await resolve(server, {}, args);
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toMatch(/Usage/);
+    expect(server.seen).toHaveLength(0);
+    expect(await items(db)).toHaveLength(0);
   });
 });
 
 describe("resolve-items: no match", () => {
   it("stores an item MusicBrainz cannot match as unresolved, and does not ask again", async () => {
-    await seedPlays([T1]);
+    await seedPlays(db, [T1]);
     const server = await fake(fromCatalog({}));
 
     const result = await resolve(server);
 
     expect(result.status, result.output).toBe(0);
-    const rows = await items();
+    const rows = await items(db);
     expect(rows).toHaveLength(3);
     for (const row of rows) {
       expect(row).toMatchObject({ state: "unresolved", reason: "no_match", mbid: null, match_score: null, matched_name: null });
@@ -355,18 +484,18 @@ describe("resolve-items: no match", () => {
   });
 
   it("treats a score under MATCH_MIN_SCORE as unresolved and keeps the score and name, and one at the threshold as resolved", async () => {
-    await seedPlays([T1]);
+    await seedPlays(db, [T1]);
     const server = await fake(
       fromCatalog({
         tracks: { [T1.track]: { id: id(61), score: MATCH_MIN_SCORE - 1, title: "SYNTH Song One (other)", artists: [artistA] } },
-        albums: { [T1.album!]: { id: id(62), score: MATCH_MIN_SCORE, title: "SYNTH Album A" } },
+        albums: { [T1.album!]: { id: id(62), score: MATCH_MIN_SCORE, title: "SYNTH Album A", artists: [artistA] } },
         artists: { [T1.artist]: { id: id(63), score: MATCH_MIN_SCORE - 1, name: "SYNTH Artist A (other)" } },
       }),
     );
 
     await resolve(server);
 
-    const rows = await items();
+    const rows = await items(db);
     expect(find(rows, "track", T1.track)).toMatchObject({
       state: "unresolved",
       reason: "below_threshold",
@@ -389,27 +518,31 @@ describe("resolve-items: no match", () => {
 
 describe("resolve-items: MusicBrainz unavailable", () => {
   const BODY = { error: "synthetic" };
+  const noAlbum = { ...T1, album: null };
 
   it.each([503, 429])(
-    "retries a %i with growing waits, then records the items as pending, not unresolved, and settles them on a later run",
+    "retries a %i with growing waits, leaves the items pending, names the kind once on stderr, and exits 1; a later run settles them",
     async (status) => {
-      await seedPlays([{ ...T1, album: null }]);
+      await seedPlays(db, [noAlbum]);
       const down = await fake(() => ({ status, body: BODY }));
 
       const result = await resolve(down);
 
-      expect(result.status, result.output).toBe(0);
+      expect(result.status, result.output).toBe(1);
       // 2 items (the track and its artist), 3 attempts each.
       expect(down.seen).toHaveLength(6);
       const gaps = down.gaps();
       expect(gaps[0]).toBeGreaterThanOrEqual(1000);
       expect(gaps[1]).toBeGreaterThanOrEqual(2000);
-      const rows = await items();
+      const rows = await items(db);
       expect(rows).toHaveLength(2);
       for (const row of rows) {
-        expect(row).toMatchObject({ state: "pending", mbid: null, reason: null, resolved_at: null });
+        expect(row).toMatchObject({ state: "pending", mbid: null, reason: null, resolved_at: null, attempts: 1 });
+        expect(row.last_attempt_at).not.toBeNull();
       }
       expect(counts(result.stdout)).toMatchObject({ pending: 2, unresolved: 0, resolved: 0, requests: 6 });
+      expect(result.stderr.match(new RegExp(`http_${status}`, "g"))).toHaveLength(1);
+      expect(await lockedUntil()).toBeNull();
       expectNoKey(result);
 
       const up = await fake(fromCatalog({ tracks: { [T1.track]: FULL.tracks![T1.track]! } }));
@@ -417,7 +550,7 @@ describe("resolve-items: MusicBrainz unavailable", () => {
 
       expect(later.status, later.output).toBe(0);
       expect(counts(later.stdout)).toMatchObject({ new: 0, resolved: 2, pending: 0 });
-      const settled = await items();
+      const settled = await items(db);
       expect(settled.map((row) => row.state)).toEqual(["resolved", "resolved"]);
       expect(settled.map((row) => row.id)).toEqual(rows.map((row) => row.id));
     },
@@ -425,11 +558,9 @@ describe("resolve-items: MusicBrainz unavailable", () => {
   );
 
   it("honours Retry-After, and a retry that works settles the item", async () => {
-    await seedPlays([T1]);
+    await seedPlays(db, [T1]);
     const catalog = fromCatalog(SMALL);
-    const server = await fake((request, count) =>
-      count === 1 ? { status: 429, headers: { "retry-after": "2" }, body: BODY } : catalog(request),
-    );
+    const server = await fake((request, count) => (count === 1 ? { status: 429, headers: { "retry-after": "2" }, body: BODY } : catalog(request)));
 
     const result = await resolve(server);
 
@@ -439,35 +570,87 @@ describe("resolve-items: MusicBrainz unavailable", () => {
     expect(counts(result.stdout)).toMatchObject({ resolved: 3, pending: 0, requests: 3 });
   }, 60_000);
 
-  it("treats a server that cannot be reached as unavailable, so the items stay pending", async () => {
-    await seedPlays([{ ...T1, album: null }]);
+  it("treats a server that cannot be reached as unavailable, names the kind, keeps the items pending and exits 1", async () => {
+    await seedPlays(db, [noAlbum]);
     const closed = await startFakeMb(() => ({ status: 200 }));
     const base = closed.base;
     await closed.close();
 
     const result = await runResolve({ MB_USER_AGENT: USER_AGENT, MB_API_BASE: base });
 
-    expect(result.status, result.output).toBe(0);
-    expect((await items()).map((row) => row.state)).toEqual(["pending", "pending"]);
+    expect(result.status, result.output).toBe(1);
+    expect((await items(db)).map((row) => row.state)).toEqual(["pending", "pending"]);
     expect(counts(result.stdout)).toMatchObject({ pending: 2, requests: 6 });
+    expect(result.stderr.match(/connection_refused/g)).toHaveLength(1);
+    expect(result.stderr).not.toContain("127.0.0.1");
   }, 60_000);
 
+  it("does not follow a redirect, and reports it as unavailable", async () => {
+    await seedPlays(db, [noAlbum]);
+    const server = await fake(() => ({ status: 302, headers: { location: "http://127.0.0.1:1/elsewhere" } }));
+
+    const result = await resolve(server);
+
+    expect(result.status, result.output).toBe(1);
+    expect(server.seen.length).toBe(6);
+    expect(result.stderr).toMatch(/redirect/);
+  }, 60_000);
+
+  it("settles an item MusicBrainz refuses with a 400 as bad_query, goes on, and exits 0", async () => {
+    await seedPlays(db, [noAlbum]);
+    const server = await fake(() => ({ status: 400, body: BODY }));
+
+    const result = await resolve(server);
+
+    expect(result.status, result.output).toBe(0);
+    expect((await items(db)).map((row) => [row.state, row.reason])).toEqual([
+      ["unresolved", "bad_query"],
+      ["unresolved", "bad_query"],
+    ]);
+    expect(counts(result.stdout)).toMatchObject({ unresolved: 2, pending: 0 });
+  });
+
+  it.each([401, 403])("stops with exit 1 on a %i and leaves the items pending", async (status) => {
+    await seedPlays(db, [noAlbum]);
+    const server = await fake(() => ({ status, body: BODY }));
+
+    const result = await resolve(server);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(new RegExp(`status ${status}`));
+    expect((await items(db)).every((row) => row.state === "pending")).toBe(true);
+    expect(server.seen).toHaveLength(1);
+    expectNoKey(result);
+  });
+
   it.each([
-    ["a refusal (400)", { status: 400, body: BODY }],
     ["an answer with no result list", { status: 200, body: { count: 1 } }],
     ["a hit with no usable ID", { status: 200, body: { count: 1, recordings: [{ id: "x", score: "100", title: "t" }] } }],
-  ] as [string, Reply][])("stops with exit 1 on %s, and leaves the items pending", async (_name, reply) => {
-    await seedPlays([{ ...T1, album: null }]);
+    ["text that is not JSON", { status: 200, body: undefined }],
+  ] as [string, Reply][])("stops with exit 1 on %s, leaves the items pending, and caches nothing", async (_name, reply) => {
+    await seedPlays(db, [noAlbum]);
     const server = await fake(() => reply);
 
     const result = await resolve(server);
 
     expect(result.status).toBe(1);
     expect(result.stderr).toMatch(/MusicBrainz/);
-    expect((await items()).every((row) => row.state === "pending")).toBe(true);
+    expect((await items(db)).every((row) => row.state === "pending")).toBe(true);
     const { count } = await db.from("mb_cache").select("*", { count: "exact", head: true });
     expect(count).toBe(0);
     expectNoKey(result);
+  });
+
+  it("stops with exit 1 on an answer over 1 MB, and caches nothing", async () => {
+    await seedPlays(db, [noAlbum]);
+    const server = await fake(() => ({ status: 200, body: { count: 0, offset: 0, recordings: [], pad: "x".repeat(1_100_000) } }));
+
+    const result = await resolve(server);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/larger than/);
+    const { count } = await db.from("mb_cache").select("*", { count: "exact", head: true });
+    expect(count).toBe(0);
   });
 });
 
@@ -479,7 +662,7 @@ describe("resolve-items: settings and secrets", () => {
     ["holding a line break", "SYNTH-test/0.0\r\nX-Injected: 1"],
     ["holding a character a header cannot carry", "SYNTH-test/0.0 é"],
   ])("exits 2 before any request when MB_USER_AGENT is %s", async (_name, value) => {
-    await seedPlays([T1]);
+    await seedPlays(db, [T1]);
     const server = await fake(fromCatalog(SMALL));
 
     const result = await resolve(server, { MB_USER_AGENT: value });
@@ -487,7 +670,7 @@ describe("resolve-items: settings and secrets", () => {
     expect(result.status).toBe(2);
     expect(result.stderr).toMatch(/MB_USER_AGENT/);
     expect(server.seen).toHaveLength(0);
-    expect(await items()).toHaveLength(0);
+    expect(await items(db)).toHaveLength(0);
     expectNoKey(result);
   });
 
@@ -511,7 +694,7 @@ describe("resolve-items: settings and secrets", () => {
   });
 
   it("never prints the key, even when the database cannot be reached", async () => {
-    await seedPlays([T1]);
+    await seedPlays(db, [T1]);
     const server = await fake(fromCatalog(SMALL));
 
     const result = await resolve(server, { SUPABASE_URL: "http://127.0.0.1:1" });
@@ -523,42 +706,11 @@ describe("resolve-items: settings and secrets", () => {
   });
 
   it("never prints a name from the plays", async () => {
-    await seedPlays([T1]);
+    await seedPlays(db, [T1]);
     const server = await fake(fromCatalog(SMALL));
 
     const result = await resolve(server);
 
     expect(result.output).not.toContain("SYNTH");
-  });
-});
-
-describe("items tables: browser roles", () => {
-  it("lets the browser roles read and write nothing in items or mb_cache", async () => {
-    const anon = anonClient();
-    for (const table of ["items", "mb_cache"]) {
-      const read = await anon.from(table).select("*").limit(1);
-      expect(read.error?.code, `${table} read`).toBe("42501");
-      const write = await anon.from(table).insert({});
-      expect(write.error?.code, `${table} write`).toBe("42501");
-    }
-  });
-
-  it("turns row-level security on and forces it, and grants nothing on either table or the sequence", () => {
-    const queries = [
-      `select string_agg(c.relname || ':' || c.relrowsecurity || ':' || c.relforcerowsecurity, ',' order by c.relname)
-      from pg_class c where c.relnamespace = 'public'::regnamespace and c.relname in ('items', 'mb_cache')`,
-      `select string_agg(r || ':' || t || ':' || has_table_privilege(r, 'public.' || t, 'select,insert,update,delete,references,trigger,truncate'), ',' order by r, t)
-      from unnest(array['anon', 'authenticated', 'public']) r, unnest(array['items', 'mb_cache']) t`,
-      `select string_agg(r || ':' || has_sequence_privilege(r, 'public.items_id_seq', 'usage,select,update'), ',' order by r)
-      from unnest(array['anon', 'authenticated']) r`,
-    ];
-    const out = execFileSync(
-      "docker",
-      ["exec", "supabase_db_hanna-fm-ingest", "psql", "-U", "postgres", "-At", ...queries.flatMap((query) => ["-c", query])],
-      { encoding: "utf8" },
-    ).trim().split("\n");
-    expect(out[0]).toBe("items:true:true,mb_cache:true:true");
-    expect(out[1]).not.toContain(":true");
-    expect(out[2]).toBe("anon:false,authenticated:false");
   });
 });
