@@ -6,7 +6,7 @@ import type { Play } from "./parse.ts";
 const SAFE_TOKEN = /^[A-Za-z0-9_]{1,40}$/;
 
 /** A database error code is printed only when it is a plain token. */
-function printableCode(code: unknown): string {
+export function printableCode(code: unknown): string {
   if (typeof code !== "string" || code === "") return "none";
   return SAFE_TOKEN.test(code) ? code : "unknown";
 }

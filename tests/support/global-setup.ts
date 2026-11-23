@@ -31,4 +31,5 @@ export default function setup() {
   }
   process.env.TEST_SUPABASE_URL = url;
   process.env.TEST_SUPABASE_SECRET_KEY = key;
+  if (values.ANON_KEY) process.env.TEST_SUPABASE_ANON_KEY = values.ANON_KEY;
 }

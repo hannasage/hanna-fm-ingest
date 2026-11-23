@@ -17,12 +17,16 @@ export type CliResult = {
  * Pass `env` to replace the connection values. An undefined value removes the variable.
  */
 function prepare(
-  path: string | undefined,
+  command: string,
+  args: string[],
   env: Record<string, string | undefined>,
 ): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
   const { url, key } = localStack();
   const childEnv: NodeJS.ProcessEnv = {
     ...process.env,
+    // A value in the shell that runs the tests must not reach the command by accident.
+    MB_USER_AGENT: undefined,
+    MB_API_BASE: undefined,
     SUPABASE_URL: url,
     SUPABASE_SECRET_KEY: key,
     ...env,
@@ -33,22 +37,24 @@ function prepare(
   // The test-only names are not part of the command's environment.
   delete childEnv.TEST_SUPABASE_URL;
   delete childEnv.TEST_SUPABASE_SECRET_KEY;
+  delete childEnv.TEST_SUPABASE_ANON_KEY;
 
   return {
     command: join(root, "node_modules", ".bin", "tsx"),
-    args: [join(root, "src", "cli.ts"), "import-export", ...(path === undefined ? [] : [path])],
+    args: [join(root, "src", "cli.ts"), command, ...args],
     env: childEnv,
   };
 }
 
-export function runImport(
-  path: string | undefined,
-  env: Record<string, string | undefined> = {},
+function run(
+  command: string,
+  args: string[],
+  env: Record<string, string | undefined>,
 ): CliResult {
-  const { command, args, env: childEnv } = prepare(path, env);
-  const result = spawnSync(command, args, {
+  const prepared = prepare(command, args, env);
+  const result = spawnSync(prepared.command, prepared.args, {
     cwd: root,
-    env: childEnv,
+    env: prepared.env,
     encoding: "utf8",
     timeout: 120_000,
   });
@@ -57,14 +63,18 @@ export function runImport(
   return { status: result.status, stdout, stderr, output: `${stdout}\n${stderr}` };
 }
 
-/** Same as runImport, without blocking, so two imports can run at once. */
-export function runImportAsync(
-  path: string,
-  extraEnv: Record<string, string | undefined> = {},
+function runAsync(
+  command: string,
+  args: string[],
+  env: Record<string, string | undefined>,
 ): Promise<CliResult> {
-  const { command, args, env } = prepare(path, extraEnv);
+  const prepared = prepare(command, args, env);
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd: root, env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(prepared.command, prepared.args, {
+      cwd: root,
+      env: prepared.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => (stdout += chunk));
@@ -72,6 +82,30 @@ export function runImportAsync(
     child.on("error", reject);
     child.on("close", (status) => resolve({ status, stdout, stderr, output: `${stdout}\n${stderr}` }));
   });
+}
+
+export function runImport(
+  path: string | undefined,
+  env: Record<string, string | undefined> = {},
+): CliResult {
+  return run("import-export", path === undefined ? [] : [path], env);
+}
+
+/** Same as runImport, without blocking, so two imports can run at once. */
+export function runImportAsync(
+  path: string,
+  extraEnv: Record<string, string | undefined> = {},
+): Promise<CliResult> {
+  return runAsync("import-export", [path], extraEnv);
+}
+
+/**
+ * Runs resolve-items. It is always asynchronous: the fake MusicBrainz server runs in the test's own
+ * process, and a blocking call would stop it from answering. Pass `env` to set MB_USER_AGENT and
+ * MB_API_BASE, or to remove a variable.
+ */
+export function runResolve(env: Record<string, string | undefined> = {}): Promise<CliResult> {
+  return runAsync("resolve-items", [], env);
 }
 
 /** Reads "name: 12" lines from the command's count report. */
