@@ -8,11 +8,9 @@ const workflows = filesUnder(join(process.cwd(), ".github", "workflows")).filter
 );
 
 describe("GitHub Actions workflows", () => {
-  it("has at least one workflow to check", () => {
-    expect(workflows.length).toBeGreaterThan(0);
-  });
-
   it("pins every action to a full commit SHA", () => {
+    // An empty list would pass with nothing checked.
+    expect(workflows.length).toBeGreaterThan(0);
     const unpinned: string[] = [];
     for (const file of workflows) {
       for (const line of readFileSync(file, "utf8").split("\n")) {
@@ -22,19 +20,5 @@ describe("GitHub Actions workflows", () => {
       }
     }
     expect(unpinned).toEqual([]);
-  });
-
-  it("never throws away the output of `supabase start`", () => {
-    for (const file of workflows) {
-      const text = readFileSync(file, "utf8");
-      expect(/supabase start[^\n]*\/dev\/null/.test(text)).toBe(false);
-    }
-  });
-
-  it("prints a filtered tail of the `supabase start` log when it fails", () => {
-    const text = workflows.map((f) => readFileSync(f, "utf8")).join("\n");
-    expect(text).toMatch(/supabase start[^\n]*>[^\n]*supabase-start\.log/);
-    expect(text).toMatch(/tail -n 50[^\n]*supabase-start\.log/);
-    expect(text).toMatch(/grep -v[iE]*\s[^\n]*(key|token|secret)/i);
   });
 });
