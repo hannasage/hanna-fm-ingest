@@ -105,3 +105,27 @@ export const RESOLVE_LOCK_NAME = "resolve-items";
 
 /** How long a run holds the lock before it must refresh it: 30 minutes. A run that dies frees it by running out. */
 export const RESOLVE_LOCK_LEASE_MS = 30 * 60 * 1000;
+
+/** A poll run record older than this many days is deleted at the end of a run. */
+export const POLLER_RUNS_KEEP_DAYS = 90;
+
+/**
+ * The run that sees the Spotify login this many days old, or older, prints a warning.
+ * The refresh token lasts about six months, so 150 days leaves a month to renew it.
+ */
+export const LOGIN_WARN_DAYS = 150;
+
+/** The age, in days, at which the Spotify login is taken to expire. The warning names it. */
+export const LOGIN_EXPIRY_DAYS = 180;
+
+/**
+ * When the runner's clock is more than this many milliseconds behind the newest run record, the delete of old
+ * records is skipped: a clock that is wrong would put the cutoff in the wrong place. 5 minutes.
+ */
+export const CLOCK_SKEW_TOLERANCE_MS = 5 * 60 * 1000;
+
+/** How long the poll waits for the database when it records a run or deletes old records. A stuck call must not hold the run open. */
+export const RECORD_TIMEOUT_MS = 10_000;
+
+/** The keys `set-state` may write to the poller_state table. Add a key here to allow it. */
+export const ALLOWED_STATE_KEYS = ["spotify_authorized_at"] as const;

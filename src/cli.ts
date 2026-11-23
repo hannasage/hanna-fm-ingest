@@ -4,8 +4,11 @@ import { UserError } from "./files.ts";
 import { importExport } from "./import-export.ts";
 import { acquireLock, refreshLock, releaseLock, type Lease } from "./job-lock.ts";
 import { MusicBrainz } from "./musicbrainz.ts";
-import { emptyPollCounts, poll, pollNotes, pollProblems } from "./poll.ts";
+import { emptyPollCounts, poll, pollNotes, pollProblemKind, pollProblems } from "./poll.ts";
 import { emptyCounts, formatPollReport, formatReport } from "./report.ts";
+import { loginReminder } from "./login-reminder.ts";
+import { finishedRecord, recordRun, stoppedRecord } from "./run-record.ts";
+import { checkState, setState, STATE_MESSAGES } from "./set-state.ts";
 import { formatResolveReport, resolveItems, emptyResolveCounts } from "./resolve-items.ts";
 import {
   DEFAULT_MB_API_BASE,
@@ -28,7 +31,7 @@ const RESOLVE_USAGE = [
   "  Exit codes: 0 done, 1 stopped, or items stayed pending, or items are stuck (exhausted), 2 bad setting or argument, 3 another run holds the lock.",
 ].join("\n");
 const POLL_USAGE = "Usage: poll\n  Reads recent plays from Spotify and stores the new ones. It takes no arguments.";
-const USAGE = `${IMPORT_USAGE}\n${RESOLVE_USAGE}\n${POLL_USAGE}`;
+const USAGE = `${IMPORT_USAGE}\n${RESOLVE_USAGE}\n${POLL_USAGE}\n${STATE_MESSAGES.usage}`;
 
 function fail(message: string, code: number): never {
   process.stderr.write(`${message}\n`);
@@ -114,14 +117,19 @@ function spotifyConfig(): SpotifyConfig {
 async function runPoll(): Promise<void> {
   const client = connect();
   const config = spotifyConfig();
+  const warn = (line: string) => process.stderr.write(`${line}\n`);
 
+  // Configuration is checked by now, so the run is recorded however it ends from here on.
+  const startedAt = new Date();
   const counts = emptyPollCounts();
   try {
-    await poll(client, config, counts, (line) => process.stderr.write(`${line}\n`));
+    await poll(client, config, counts, warn);
   } catch (error) {
     // A UserError holds fixed text. Any other failure shows its kind only, never its text,
     // which could hold a token, a key or a play.
     process.stderr.write(`${describeStop(error, "poll")}\n`);
+    await recordRun(client, stoppedRecord(startedAt, counts, error), warn);
+    await warnAboutLogin(client, warn);
     process.exit(1);
   }
   process.stdout.write(formatPollReport(counts));
@@ -131,7 +139,33 @@ async function runPoll(): Promise<void> {
   for (const problem of problems) process.stderr.write(`::error::${problem}\n`);
   // A window of only local files and episodes is green. It gets a plain note, not an annotation.
   for (const note of pollNotes(counts)) process.stderr.write(`${note}\n`);
+  await recordRun(client, finishedRecord(startedAt, counts, pollProblemKind(counts)), warn);
+  await warnAboutLogin(client, warn);
   if (problems.length > 0) process.exit(1);
+}
+
+/** The last thing a poll run does: warn when the Spotify login date is missing or old. It never changes the exit code. */
+async function warnAboutLogin(client: ReturnType<typeof connect>, warn: (line: string) => void): Promise<void> {
+  const line = await loginReminder(client);
+  if (line !== null) warn(line);
+}
+
+/** Records one fact about the poller, such as when the Spotify login was authorized. Nothing it was given is ever printed. */
+async function runSetState(args: string[]): Promise<void> {
+  if (args.length !== 2) fail(STATE_MESSAGES.usage, 2);
+  let state;
+  try {
+    state = checkState(args[0]!, args[1]!);
+  } catch (error) {
+    fail(describeStop(error, "command"), 2);
+  }
+  const client = connect();
+  try {
+    await setState(client, state.key, state.value);
+  } catch (error) {
+    fail(describeStop(error, "command"), 1);
+  }
+  process.stdout.write(`Recorded ${state.key}.\n`);
 }
 
 /** MusicBrainz asks every client for a User-Agent that says who it is. A header cannot hold a line break or a non-ASCII character. */
@@ -255,6 +289,7 @@ async function main(argv: string[]): Promise<void> {
     if (rest.length > 0) fail(POLL_USAGE, 2);
     await runPoll();
   }
+  else if (command === "set-state") await runSetState(rest);
   else fail(USAGE, 2);
 }
 

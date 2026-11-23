@@ -11,6 +11,7 @@
     "import-export": "tsx src/cli.ts import-export",
     "poll": "tsx src/cli.ts poll",
     "resolve-items": "tsx src/cli.ts resolve-items",
+    "set-state": "tsx src/cli.ts set-state",
     "schema:sync": "tsx src/schema-sync.ts",
     "schema:check": "tsx src/schema-check.ts",
     "typecheck": "tsc --noEmit",

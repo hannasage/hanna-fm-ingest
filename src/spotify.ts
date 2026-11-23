@@ -51,7 +51,7 @@ async function readCapped(response: Response): Promise<string> {
   const declared = Number(response.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
     await response.body?.cancel();
-    throw new UserError(MESSAGES.tooLarge);
+    throw new UserError(MESSAGES.tooLarge, "bad_response");
   }
   if (response.body === null) return "";
   const reader = response.body.getReader();
@@ -64,7 +64,7 @@ async function readCapped(response: Response): Promise<string> {
     total += value.byteLength;
     if (total > MAX_RESPONSE_BYTES) {
       await reader.cancel();
-      throw new UserError(MESSAGES.tooLarge);
+      throw new UserError(MESSAGES.tooLarge, "bad_response");
     }
     text += decoder.decode(value, { stream: true });
   }
@@ -82,13 +82,13 @@ async function send(url: string, init: RequestInit): Promise<Answer> {
       signal: AbortSignal.timeout(SPOTIFY_TIMEOUT_MS),
     });
   } catch {
-    throw new UserError(MESSAGES.network);
+    throw new UserError(MESSAGES.network, "network");
   }
   try {
     return { status: response.status, headers: response.headers, text: await readCapped(response) };
   } catch (error) {
     if (error instanceof UserError) throw error;
-    throw new UserError(MESSAGES.network);
+    throw new UserError(MESSAGES.network, "network");
   }
 }
 
@@ -96,7 +96,7 @@ function parseJson(text: string): unknown {
   try {
     return JSON.parse(text);
   } catch {
-    throw new UserError(MESSAGES.notJson);
+    throw new UserError(MESSAGES.notJson, "bad_response");
   }
 }
 
@@ -128,7 +128,7 @@ export async function refreshAccessToken(config: SpotifyConfig): Promise<Token> 
     body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: config.refreshToken }),
   });
 
-  if (answer.status === 429) throw new UserError(MESSAGES.limited(retryHint(answer.headers)));
+  if (answer.status === 429) throw new UserError(MESSAGES.limited(retryHint(answer.headers)), "rate_limited");
   if (answer.status < 200 || answer.status > 299) {
     // Only the error code is read, and only to choose a message. It is never printed.
     let code: unknown;
@@ -138,16 +138,16 @@ export async function refreshAccessToken(config: SpotifyConfig): Promise<Token> 
     } catch {
       code = undefined;
     }
-    if (code === "invalid_grant") throw new UserError(MESSAGES.renew);
+    if (code === "invalid_grant") throw new UserError(MESSAGES.renew, "login_expired");
     if (code === "invalid_client" || answer.status === 401 || answer.status === 403) {
-      throw new UserError(MESSAGES.client);
+      throw new UserError(MESSAGES.client, "forbidden");
     }
-    throw new UserError(MESSAGES.status(answer.status));
+    throw new UserError(MESSAGES.status(answer.status), "spotify_unavailable");
   }
 
   const body = parseJson(answer.text);
   if (!isRecord(body) || typeof body.access_token !== "string" || body.access_token === "") {
-    throw new UserError(MESSAGES.shape);
+    throw new UserError(MESSAGES.shape, "bad_response");
   }
   const next = body.refresh_token;
   const rotated =
@@ -177,12 +177,12 @@ export async function fetchRecentlyPlayed(
     headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
   });
 
-  if (answer.status === 401 || answer.status === 403) throw new UserError(MESSAGES.refused(answer.status));
-  if (answer.status === 429) throw new UserError(MESSAGES.limited(retryHint(answer.headers)));
-  if (answer.status !== 200) throw new UserError(MESSAGES.status(answer.status));
+  if (answer.status === 401 || answer.status === 403) throw new UserError(MESSAGES.refused(answer.status), "forbidden");
+  if (answer.status === 429) throw new UserError(MESSAGES.limited(retryHint(answer.headers)), "rate_limited");
+  if (answer.status !== 200) throw new UserError(MESSAGES.status(answer.status), "spotify_unavailable");
 
   const body = parseJson(answer.text);
-  if (!isRecord(body) || !Array.isArray(body.items)) throw new UserError(MESSAGES.shape);
-  if (body.items.length > POLL_LIMIT) throw new UserError(MESSAGES.tooMany);
+  if (!isRecord(body) || !Array.isArray(body.items)) throw new UserError(MESSAGES.shape, "bad_response");
+  if (body.items.length > POLL_LIMIT) throw new UserError(MESSAGES.tooMany, "bad_response");
   return body.items;
 }

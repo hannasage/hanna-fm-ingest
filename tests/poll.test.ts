@@ -26,6 +26,11 @@ const db = adminClient();
 beforeEach(async () => {
   const { error } = await db.from("plays").delete().gt("id", 0);
   if (error) throw new Error(`Could not clear plays: ${error.code}`);
+  // A recent login date, so the end-of-run login reminder stays quiet and these tests read only their own lines.
+  const state = await db
+    .from("poller_state")
+    .upsert({ key: "spotify_authorized_at", value: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString() });
+  if (state.error) throw new Error(`Could not seed poller_state: ${state.error.code}`);
 });
 
 // Messages the command must print, exactly. Each is plain and holds no token, key or response text.
