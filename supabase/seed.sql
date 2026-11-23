@@ -1,0 +1,1 @@
+-- No seed data. The importer tests build their own rows from synthetic fixtures.

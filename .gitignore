@@ -1,0 +1,70 @@
+# Secrets and environment files. Only the placeholder file is tracked.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Data folders. No data file lives in this repository.
+data/
+/exports/
+/export/
+/dumps/
+
+# Export and dump file types
+*.zip
+*.csv
+*.tsv
+*.ndjson
+*.jsonl
+*.dump
+*.sql.gz
+*.sqlite
+*.sqlite3
+*.db
+*-export.json
+*-export-*.json
+*.export.json
+StreamingHistory*.json
+Streaming_History*.json
+endsong*.json
+my_spotify_data*
+Spotify*Account*Data*
+YourLibrary.json
+Playlist*.json
+Userdata.json
+*.tar.gz
+*.tgz
+*.7z
+*.xlsx
+*.parquet
+*.bak
+.envrc
+*.p12
+*.pfx
+# SQL files stay out unless they are the seed or a migration.
+*.sql
+!supabase/seed.sql
+!supabase/migrations/*.sql
+
+# Supabase local temp folders
+supabase/.temp/
+supabase/.branches/
+supabase/.env
+supabase/.env.*
+supabase/volumes/
+
+# Synthetic fixtures are the one exception to the export rules above. Real
+# export names such as Streaming_History_Audio_2020.json stay ignored.
+!tests/fixtures/
+!tests/fixtures/*.fixture.json
+
+# Dependencies and build output
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Tooling and OS
+.DS_Store
+npm-debug.log*

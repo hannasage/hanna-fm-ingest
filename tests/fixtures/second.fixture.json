@@ -1,0 +1,44 @@
+[
+  {
+    "ts": "2024-01-02T09:00:00Z",
+    "ms_played": 180000,
+    "master_metadata_track_name": "Synthetic Song Four",
+    "master_metadata_album_artist_name": "Synthetic Artist C",
+    "master_metadata_album_album_name": "Synthetic Album C",
+    "spotify_track_uri": "spotify:track:SYNTH000000000000000004",
+    "episode_name": null,
+    "spotify_episode_uri": null,
+    "incognito_mode": false,
+    "ip_addr": "203.0.113.9",
+    "conn_country": "ZZ",
+    "platform": "SYNTH-PLATFORM"
+  },
+  {
+    "ts": "2024-02-01T12:00:00Z",
+    "ms_played": 200000,
+    "master_metadata_track_name": "Synthetic Song Seven",
+    "master_metadata_album_artist_name": "Synthetic Artist E",
+    "master_metadata_album_album_name": "Synthetic Album E",
+    "spotify_track_uri": "spotify:track:SYNTH000000000000000007",
+    "episode_name": null,
+    "spotify_episode_uri": null,
+    "incognito_mode": false,
+    "ip_addr": "203.0.113.12",
+    "conn_country": "ZZ",
+    "platform": "SYNTH-PLATFORM"
+  },
+  {
+    "ts": "2024-02-01T12:04:00Z",
+    "ms_played": 100000,
+    "master_metadata_track_name": "Synthetic Song Eight",
+    "master_metadata_album_artist_name": "Synthetic Artist E",
+    "master_metadata_album_album_name": "Synthetic Album E",
+    "spotify_track_uri": "spotify:track:SYNTH000000000000000008",
+    "episode_name": null,
+    "spotify_episode_uri": null,
+    "incognito_mode": false,
+    "ip_addr": "203.0.113.12",
+    "conn_country": "ZZ",
+    "platform": "SYNTH-PLATFORM"
+  }
+]
