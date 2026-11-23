@@ -1,10 +1,13 @@
-import { copyFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { buildManifest, manifestPath } from "./schema-manifest.ts";
 
 /**
  * Copies the site repository's migrations into this repository's vendored copy.
  * The site repository owns the schema. Run this from the root of this repository,
  * with HANNA_FM_PATH set to a sibling clone of the site repository.
+ * It then writes a checksum manifest of the vendored migrations, which `schema:check`
+ * and the tests compare against.
  */
 function main(): void {
   const sitePath = process.env.HANNA_FM_PATH;
@@ -28,6 +31,8 @@ function main(): void {
   const target = join(process.cwd(), "supabase", "migrations");
   mkdirSync(target, { recursive: true });
   for (const name of files) copyFileSync(join(source, name), join(target, name));
+  writeFileSync(manifestPath(process.cwd()), `${JSON.stringify(buildManifest(process.cwd()), null, 2)}\n`);
+  writeFileSync(manifestPath(process.cwd()), `${JSON.stringify(buildManifest(process.cwd()), null, 2)}\n`);
   process.stdout.write(`Copied ${files.length} migration${files.length === 1 ? "" : "s"}:\n${files.map((f) => `  ${f}`).join("\n")}\n`);
 }
 

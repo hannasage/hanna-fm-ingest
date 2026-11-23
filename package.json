@@ -9,6 +9,8 @@
   "scripts": {
     "import-export": "tsx src/cli.ts import-export",
     "schema:sync": "tsx src/schema-sync.ts",
+    "schema:check": "tsx src/schema-check.ts",
+    "schema:check": "tsx src/schema-check.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",

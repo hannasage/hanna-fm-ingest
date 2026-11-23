@@ -1,4 +1,3 @@
--- Frozen contract for ticket 2. Same file goes into the site repo as a migration and into the ingest repo as a vendored copy.
 create table public.plays (
   id          bigint generated always as identity primary key,
   track_uri   text        not null,
@@ -14,3 +13,4 @@ create table public.plays (
 alter table public.plays enable row level security;
 alter table public.plays force row level security;
 revoke all on public.plays from anon, authenticated, public;
+create index plays_ended_at_idx on public.plays (ended_at);
