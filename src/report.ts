@@ -1,4 +1,6 @@
 import { DROP_REASONS, type DropReason } from "./parse.ts";
+import type { PollCounts } from "./poll.ts";
+import { POLL_SKIP_REASONS } from "./poll-mapping.ts";
 
 export type Counts = {
   read: number;
@@ -40,6 +42,23 @@ export function formatReport(counts: Counts, options: { partial?: boolean } = {}
     ...DROP_REASONS.map((reason) => `  ${reason}: ${counts.dropped[reason]}`),
     `not_attempted: ${notAttempted(counts)}`,
     ...(options.partial ? ["partial: true"] : []),
+    "",
+  ].join("\n");
+}
+
+/**
+ * Counts only, for the poll. No track, artist or album name ever goes in this text.
+ * `fetched` always equals stored + duplicate + skipped.
+ */
+export function formatPollReport(counts: PollCounts): string {
+  const skipped = POLL_SKIP_REASONS.reduce((sum, reason) => sum + counts.skipped[reason], 0);
+  return [
+    `fetched: ${counts.fetched}`,
+    `stored: ${counts.stored}`,
+    `duplicate: ${counts.duplicate}`,
+    `skipped: ${skipped}`,
+    ...POLL_SKIP_REASONS.map((reason) => `  ${reason}: ${counts.skipped[reason]}`),
+    `possible_gap: ${counts.possibleGap}`,
     "",
   ].join("\n");
 }

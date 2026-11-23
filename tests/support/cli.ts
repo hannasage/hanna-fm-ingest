@@ -17,6 +17,7 @@ export type CliResult = {
  * Pass `env` to replace the connection values. An undefined value removes the variable.
  */
 function prepare(
+  commandName: string,
   path: string | undefined,
   env: Record<string, string | undefined>,
 ): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
@@ -36,7 +37,7 @@ function prepare(
 
   return {
     command: join(root, "node_modules", ".bin", "tsx"),
-    args: [join(root, "src", "cli.ts"), "import-export", ...(path === undefined ? [] : [path])],
+    args: [join(root, "src", "cli.ts"), commandName, ...(path === undefined ? [] : [path])],
     env: childEnv,
   };
 }
@@ -45,7 +46,7 @@ export function runImport(
   path: string | undefined,
   env: Record<string, string | undefined> = {},
 ): CliResult {
-  const { command, args, env: childEnv } = prepare(path, env);
+  const { command, args, env: childEnv } = prepare("import-export", path, env);
   const result = spawnSync(command, args, {
     cwd: root,
     env: childEnv,
@@ -62,7 +63,7 @@ export function runImportAsync(
   path: string,
   extraEnv: Record<string, string | undefined> = {},
 ): Promise<CliResult> {
-  const { command, args, env } = prepare(path, extraEnv);
+  const { command, args, env } = prepare("import-export", path, extraEnv);
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd: root, env, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
@@ -82,4 +83,38 @@ export function counts(stdout: string): Record<string, number> {
     if (match?.[1] && match[2]) found[match[1]] = Number(match[2]);
   }
   return found;
+}
+
+/**
+ * Runs `poll` without blocking. It must not block: the fake Spotify server runs in this
+ * same process, and a blocked process cannot answer it.
+ * The Spotify names start unset, so a test sets only what it means to.
+ */
+export function runPoll(
+  env: Record<string, string | undefined> = {},
+  extraArgs: string[] = [],
+): Promise<CliResult> {
+  const prepared = prepare("poll", undefined, {
+    SPOTIFY_CLIENT_ID: undefined,
+    SPOTIFY_CLIENT_SECRET: undefined,
+    SPOTIFY_REFRESH_TOKEN: undefined,
+    SPOTIFY_ACCOUNTS_BASE: undefined,
+    SPOTIFY_API_BASE: undefined,
+    ...env,
+  });
+  const { command, env: childEnv } = prepared;
+  const args = [...prepared.args, ...extraArgs];
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd: root, env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
+    const timer = setTimeout(() => child.kill("SIGKILL"), 120_000);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => (stdout += chunk));
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => (stderr += chunk));
+    child.on("error", reject);
+    child.on("close", (status) => {
+      clearTimeout(timer);
+      resolve({ status, stdout, stderr, output: `${stdout}\n${stderr}` });
+    });
+  });
 }

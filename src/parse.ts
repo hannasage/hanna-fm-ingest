@@ -35,12 +35,12 @@ function isBlank(value: unknown): boolean {
 }
 
 /** Text the database can store: a string with no NUL character. */
-function storableText(value: unknown): value is string {
+export function storableText(value: unknown): value is string {
   return typeof value === "string" && !value.includes("\u0000");
 }
 
 /** Returns the time as an ISO string, or null when it is not a real moment. */
-function parseTimestamp(value: unknown): string | null {
+export function parseTimestamp(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const match = ISO_TIMESTAMP.exec(value);
   if (!match) return null;

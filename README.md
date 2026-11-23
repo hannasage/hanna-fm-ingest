@@ -2,7 +2,7 @@
 
 The private data side of hanna.fm. It polls Spotify every 30 minutes, imports Spotify's Extended Streaming History export, resolves items to MusicBrainz IDs, and builds the derived data the site shows.
 
-Status: in development. The export importer is the first piece.
+Status: in development. The export importer and the poller are built.
 
 ## Rules for every commit
 
@@ -41,6 +41,25 @@ Other behavior:
 - `SUPABASE_URL` must be https, unless the host is `localhost` or `127.0.0.1`. Otherwise the command exits 2 before it sends the key.
 
 The key names the importer reads are in one table, `src/mapping.ts`. Ticket 7 checks them against a real export.
+
+## Poll Spotify
+
+```
+export SUPABASE_URL=... SUPABASE_SECRET_KEY=...
+export SPOTIFY_CLIENT_ID=... SPOTIFY_CLIENT_SECRET=... SPOTIFY_REFRESH_TOKEN=...
+npm run poll
+```
+
+One run trades the refresh token for an access token, asks Spotify's recently-played call for up to 50 plays after the latest stored end time, and stores each new one with source `poll` and no play length (`ms_played` is null). It prints counts only: `fetched`, `stored`, `duplicate`, `skipped` by reason (`no_track`, `malformed`), and `possible_gap`.
+
+- A play is a repeat when the same track has a stored end time within `DEDUPE_WINDOW_SECONDS` (10, in `src/settings.ts`) of it, on either side. The table's exact key still applies.
+- `possible_gap: true` means exactly 50 plays came back, so older plays may be missing. The run still exits 0.
+- A new refresh token in Spotify's answer prints a warning without the token. Update the `SPOTIFY_REFRESH_TOKEN` secret.
+- Exit 1 for: a rejected or expired login, 401, 403, 429 (with the retry hint when Spotify sends one), malformed JSON, and any network failure. No message holds a token, a key or a response body.
+- `SPOTIFY_ACCOUNTS_BASE` and `SPOTIFY_API_BASE` are optional and for tests. They follow the same https-unless-localhost rule as `SUPABASE_URL`.
+- Spotify refresh tokens last 6 months from authorization, and refreshing does not extend that. Renew the login before then.
+- `.github/workflows/poll.yml` runs this every 30 minutes on the main branch of this repository. It needs five Actions secrets, named as above.
+- `played_at` may be the start of a play, not the end. It is stored as `ended_at` until ticket 7 measures it.
 
 ## Local development
 

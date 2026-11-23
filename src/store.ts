@@ -1,12 +1,23 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { UserError } from "./files.ts";
-import type { Play } from "./parse.ts";
+
+/** One row of the plays table, as the importer or the poller writes it. */
+export type PlayRow = {
+  track_uri: string;
+  track_name: string;
+  artist_name: string;
+  album_name: string | null;
+  ended_at: string;
+  /** Null for a play the poller stored, because Spotify's recently-played call gives no play length. */
+  ms_played: number | null;
+  source: "export" | "poll";
+};
 
 /** The pattern the site repository uses for any value it prints from a failure. */
 const SAFE_TOKEN = /^[A-Za-z0-9_]{1,40}$/;
 
 /** A database error code is printed only when it is a plain token. */
-function printableCode(code: unknown): string {
+export function printableCode(code: unknown): string {
   if (typeof code !== "string" || code === "") return "none";
   return SAFE_TOKEN.test(code) ? code : "unknown";
 }
@@ -16,7 +27,7 @@ function printableCode(code: unknown): string {
  * A play already stored (same track_uri and ended_at) is skipped, never changed,
  * so a failed run can simply be run again.
  */
-export async function storeBatch(client: SupabaseClient, batch: Play[]): Promise<number> {
+export async function storeBatch(client: SupabaseClient, batch: PlayRow[]): Promise<number> {
   const { data, error } = await client
     .from("plays")
     .upsert(batch, { onConflict: "track_uri,ended_at", ignoreDuplicates: true })

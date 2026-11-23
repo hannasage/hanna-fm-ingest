@@ -8,6 +8,7 @@
   },
   "scripts": {
     "import-export": "tsx src/cli.ts import-export",
+    "poll": "tsx src/cli.ts poll",
     "schema:sync": "tsx src/schema-sync.ts",
     "schema:check": "tsx src/schema-check.ts",
     "schema:check": "tsx src/schema-check.ts",
