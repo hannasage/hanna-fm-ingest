@@ -319,7 +319,8 @@ describe("resolve-items: one run at a time", () => {
     expect(result.stderr).toMatch(/another/i);
     expect(server.seen).toHaveLength(0);
     expect(await items(db)).toHaveLength(0);
-    expect(await lockedUntil()).toBe(until.replace("Z", "+00:00"));
+    // The database writes the time without trailing zeros, so compare the instants, not the text.
+    expect(new Date((await lockedUntil())!).getTime()).toBe(new Date(until).getTime());
     expectNoKey(result);
   });
 
@@ -424,20 +425,25 @@ describe("resolve-items: flags", () => {
     expect((await items(db)).filter((row) => row.state === "pending")).toHaveLength(4);
   });
 
-  it("skips an item that failed too often unless --retry-failed is passed, and says so", async () => {
+  it("exits 1 and counts as exhausted an item that failed too often, names --retry-failed, and tries it only when that flag is passed", async () => {
     await seedPlays(db, [T1]);
     await db.from("items").insert({ kind: "track", name: T1.track, source_key: T1.uri, attempts: RESOLVE_MAX_ATTEMPTS });
     const server = await fake(fromCatalog(SMALL));
 
-    const skipped = await resolve(server);
-    expect(skipped.status, skipped.output).toBe(0);
-    expect(counts(skipped.stdout)).toMatchObject({ skipped: 1 });
-    expect(skipped.stderr).toMatch(/--retry-failed/);
+    const stuck = await resolve(server);
+    expect(stuck.status, stuck.output).toBe(1);
+    expect(counts(stuck.stdout)).toMatchObject({ skipped: 0, exhausted: 1 });
+    expect(stuck.stderr).toMatch(/--retry-failed/);
+    expect(stuck.stderr).toMatch(/stuck/);
     expect(find(await items(db), "track", T1.track).state).toBe("pending");
+    expect(server.seen.some((request) => request.path.endsWith("/recording"))).toBe(false);
+
+    // Still stuck on the next run, and still exit 1: it is never quiet.
+    expect((await resolve(server)).status).toBe(1);
 
     const retried = await resolve(server, {}, ["--retry-failed"]);
     expect(retried.status, retried.output).toBe(0);
-    expect(counts(retried.stdout)).toMatchObject({ skipped: 0, resolved: 1 });
+    expect(counts(retried.stdout)).toMatchObject({ skipped: 0, exhausted: 0, resolved: 1 });
     expect(find(await items(db), "track", T1.track).state).toBe("resolved");
   });
 
@@ -487,9 +493,9 @@ describe("resolve-items: no match", () => {
     await seedPlays(db, [T1]);
     const server = await fake(
       fromCatalog({
-        tracks: { [T1.track]: { id: id(61), score: MATCH_MIN_SCORE - 1, title: "SYNTH Song One (other)", artists: [artistA] } },
+        tracks: { [T1.track]: { id: id(61), score: MATCH_MIN_SCORE - 1, title: T1.track, artists: [artistA] } },
         albums: { [T1.album!]: { id: id(62), score: MATCH_MIN_SCORE, title: "SYNTH Album A", artists: [artistA] } },
-        artists: { [T1.artist]: { id: id(63), score: MATCH_MIN_SCORE - 1, name: "SYNTH Artist A (other)" } },
+        artists: { [T1.artist]: { id: id(63), score: MATCH_MIN_SCORE - 1, name: T1.artist } },
       }),
     );
 
@@ -501,10 +507,61 @@ describe("resolve-items: no match", () => {
       reason: "below_threshold",
       mbid: null,
       match_score: MATCH_MIN_SCORE - 1,
-      matched_name: "SYNTH Song One (other)",
+      matched_name: T1.track,
     });
     expect(find(rows, "artist", T1.artist)).toMatchObject({ state: "unresolved", reason: "below_threshold", match_score: MATCH_MIN_SCORE - 1 });
     expect(find(rows, "album", T1.album!)).toMatchObject({ state: "resolved", mbid: id(62), match_score: MATCH_MIN_SCORE });
+  });
+
+  it("does not resolve a remix, a different title, a featured credit or a different artist, however high the score, and keeps the refused hit's score and name", async () => {
+    await seedPlays(db, [T1, T2, T3]);
+    const other = { id: id(70), name: "SYNTH Someone Else" };
+    const server = await fake(
+      fromCatalog({
+        tracks: {
+          [T1.track]: { id: id(71), score: 100, title: "SYNTH Song One (SYNTH Remix)", artists: [artistA] },
+          [T2.track]: { id: id(72), score: 98, title: T2.track, artists: [other, artistA] },
+        },
+        albums: { [T1.album!]: { id: id(73), score: 99, title: T1.album!, artists: [other] } },
+        artists: { [T3.artist]: { id: id(74), score: 97, name: "SYNTH Artist B and Friends" } },
+      }),
+    );
+
+    const result = await resolve(server);
+
+    expect(result.status, result.output).toBe(0);
+    const rows = await items(db);
+    expect(find(rows, "track", T1.track)).toMatchObject({ state: "unresolved", reason: "no_match", mbid: null, match_score: 100, matched_name: "SYNTH Song One (SYNTH Remix)" });
+    expect(find(rows, "track", T2.track)).toMatchObject({ state: "unresolved", reason: "no_match", mbid: null, match_score: 98, matched_name: T2.track });
+    expect(find(rows, "album", T1.album!)).toMatchObject({ state: "unresolved", reason: "no_match", mbid: null, match_score: 99 });
+    expect(find(rows, "artist", T3.artist)).toMatchObject({
+      state: "unresolved",
+      reason: "no_match",
+      mbid: null,
+      match_score: 97,
+      matched_name: "SYNTH Artist B and Friends",
+    });
+  });
+
+  it("resolves an artist by an alias MusicBrainz returned in the hit, and not by one it did not", async () => {
+    await seedPlays(db, [
+      { uri: uri(30), track: "SYNTH Unmatched One", artist: "SYNTH Alias Artist", album: null },
+      { uri: uri(31), track: "SYNTH Unmatched Two", artist: "SYNTH Other Artist", album: null },
+    ]);
+    const server = await fake(
+      fromCatalog({
+        artists: {
+          "SYNTH Alias Artist": { id: id(75), score: 95, name: "SYNTH Legal Name", aliases: ["SYNTH Stage Name", "synth  alias artist"] },
+          "SYNTH Other Artist": { id: id(76), score: 95, name: "SYNTH Legal Name Two", aliases: ["SYNTH Stage Name Two"] },
+        },
+      }),
+    );
+
+    await resolve(server);
+
+    const rows = await items(db);
+    expect(find(rows, "artist", "SYNTH Alias Artist")).toMatchObject({ state: "resolved", mbid: id(75), matched_name: "SYNTH Legal Name" });
+    expect(find(rows, "artist", "SYNTH Other Artist")).toMatchObject({ state: "unresolved", reason: "no_match", match_score: 95 });
   });
 
   it("has a threshold of 90", () => {
@@ -536,9 +593,9 @@ describe("resolve-items: MusicBrainz unavailable", () => {
       expect(gaps[1]).toBeGreaterThanOrEqual(2000);
       const rows = await items(db);
       expect(rows).toHaveLength(2);
+      // An outage says nothing about an item, so no attempt is charged for it.
       for (const row of rows) {
-        expect(row).toMatchObject({ state: "pending", mbid: null, reason: null, resolved_at: null, attempts: 1 });
-        expect(row.last_attempt_at).not.toBeNull();
+        expect(row).toMatchObject({ state: "pending", mbid: null, reason: null, resolved_at: null, attempts: 0, last_attempt_at: null });
       }
       expect(counts(result.stdout)).toMatchObject({ pending: 2, unresolved: 0, resolved: 0, requests: 6 });
       expect(result.stderr.match(new RegExp(`http_${status}`, "g"))).toHaveLength(1);
@@ -596,19 +653,53 @@ describe("resolve-items: MusicBrainz unavailable", () => {
     expect(result.stderr).toMatch(/redirect/);
   }, 60_000);
 
-  it("settles an item MusicBrainz refuses with a 400 as bad_query, goes on, and exits 0", async () => {
-    await seedPlays(db, [noAlbum]);
-    const server = await fake(() => ({ status: 400, body: BODY }));
+  it("leaves an item MusicBrainz refuses with a 400 pending with one attempt, goes on, and exits 1", async () => {
+    await seedPlays(db, [T1, { ...T2, album: null }]);
+    const catalog = fromCatalog(SMALL);
+    const server = await fake((request) => (request.fields.recording === T2.track ? { status: 400, body: BODY } : catalog(request)));
 
     const result = await resolve(server);
 
-    expect(result.status, result.output).toBe(0);
-    expect((await items(db)).map((row) => [row.state, row.reason])).toEqual([
-      ["unresolved", "bad_query"],
-      ["unresolved", "bad_query"],
-    ]);
-    expect(counts(result.stdout)).toMatchObject({ unresolved: 2, pending: 0 });
+    expect(result.status, result.output).toBe(1);
+    const rows = await items(db);
+    expect(find(rows, "track", T2.track)).toMatchObject({ state: "pending", reason: null, attempts: 1 });
+    expect(find(rows, "track", T1.track).state).toBe("resolved");
+    expect(counts(result.stdout)).toMatchObject({ pending: 1, resolved: 3, remaining: 0 });
+    expect(result.stderr).toMatch(/refused/);
   });
+
+  it("does not settle or charge any item when every lookup is refused, as with a wrong MB_API_BASE", async () => {
+    await seedPlays(db, [noAlbum]);
+    const server = await fake(() => ({ status: 404, body: BODY }));
+
+    const result = await resolve(server);
+
+    expect(result.status, result.output).toBe(1);
+    expect((await items(db)).every((row) => row.state === "pending" && row.attempts === 0)).toBe(true);
+    expect(counts(result.stdout)).toMatchObject({ unresolved: 0, pending: 2 });
+  });
+
+  it("refreshes the lock lease before every request to MusicBrainz, not only before each item", async () => {
+    await seedPlays(db, [noAlbum]);
+    const server = await fake(() => ({ status: 503, body: BODY }));
+    const seen = new Set<string>();
+    const running = startResolve({ MB_USER_AGENT: USER_AGENT, MB_API_BASE: server.base });
+    let finished = false;
+    void running.done.then(() => void (finished = true));
+
+    while (!finished) {
+      const value = await lockedUntil();
+      if (value) seen.add(value);
+      await new Promise((done) => setTimeout(done, 50));
+    }
+    const result = await running.done;
+
+    expect(result.status, result.output).toBe(1);
+    expect(server.seen).toHaveLength(6);
+    // Refreshed only before each item, the lease would take 2 values in this run (one for each item). The retries of one
+    // item are seconds apart, and each one starts with a refresh, so the lease takes more values than that.
+    expect(seen.size).toBeGreaterThanOrEqual(4);
+  }, 60_000);
 
   it.each([401, 403])("stops with exit 1 on a %i and leaves the items pending", async (status) => {
     await seedPlays(db, [noAlbum]);

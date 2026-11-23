@@ -59,30 +59,41 @@ How it matches:
 
 - Tracks search MusicBrainz recordings by title, artist and album. Albums search release groups by title and artist. Artists search by name. Each search asks for 5 hits (`MB_MATCH_FETCH_LIMIT`).
 - A track or album is searched only when the plays name its artist. With no artist it is `unresolved` with reason `no_artist`, because a title alone matches too many songs. A blank name is `empty_name`. A name over 200 characters is `name_too_long`, and no request is made.
-- When the artist is known, a hit counts only if one of its artist credits, normalized as source keys are, equals the artist played, or is the artist already matched.
+- A hit counts only if it names what was played. Names are compared the way source keys are: NFKC, lower case, accents removed, curly quotes made straight, `&` read as `and`, spaces collapsed.
+- An artist hit counts only if its name, or one of the aliases it came with, equals the artist played. Any other hit is `no_match`, with its score and name kept for audit.
+- A track or album hit counts only if its title equals the title played, and, when the plays name an artist, its first (primary) artist credit, under any name it carries, equals that artist or is the artist already matched. A match only on a featured credit does not count. So a remix or a "feat." recording never resolves on score alone.
+- An artist MBID learned this way, from a matched artist hit or from a matched track's primary credit, is the only one later hits may rely on.
 - Among the hits that count, those whose raw score is at least `MATCH_MIN_SCORE` (90, in `src/settings.ts`, compared with no rounding) win. If two different MusicBrainz IDs both do, the item is `ambiguous` and nothing is settled. A lower best score is `below_threshold`. No usable hit is `no_match`. The score and the matched name are stored either way, so a wrong match can be audited.
 - When no recording matches the exact album phrase, the track is searched once more without the album.
-- A matched track names its artists. When one is the artist the plays name, that artist row settles from the credit with no search, a null score and reason `credit`.
+- A matched track names its artists. When its primary artist is the artist the plays name, that artist row settles from the credit with no search, a null score and reason `credit`.
 - Every request goes through one queue that waits at least one second after the last request ended. A repeat lookup is served from `mb_cache` (keyed by the SHA-256 of the request URL, holding only the parsed hits, expiring after 90 days) and sends nothing. At most 1 MB is read from an answer, redirects are never followed, and NUL characters are stripped from every name stored.
 - Two Spotify tracks can be one recording. The first keeps the MBID. The other keeps its own row with `merged_into` set to the first, so no alias is lost. `merged_into` must point to a row of the same kind.
 
 When MusicBrainz fails:
 
-- A 429, any 5xx, or no answer is retried up to `MB_MAX_ATTEMPTS` times (3), waiting 1 s, then 2 s, longer if `Retry-After` says so. `Retry-After` also holds the queue after the last try, so the next item is not sent into a server that said wait. After the last try the item stays `pending`, never `unresolved`, its `attempts` goes up by one, and the next run tries it again.
+- A 429, any 5xx, or no answer is retried up to `MB_MAX_ATTEMPTS` times (3), waiting 1 s, then 2 s, longer if `Retry-After` says so. A `Retry-After` is cut to `MB_RETRY_AFTER_MAX_MS` (120 s). It also holds the queue after the last try, so the next item is not sent into a server that said wait. After the last try the item stays `pending`, never `unresolved`, and the next run tries it again.
+- A failed lookup is charged to its item as one attempt only once MusicBrainz has then answered a different lookup, which shows the failure was the item's own. An outage, or a run that stops on a breaker, charges nothing: not the item that tripped it, and not the ones before it. A failure at the very end of a run, with no answer after it, is not charged either, so such an item stays `pending` and the run exits 1 each time.
 - The reason is kept as a fixed word (`http_503`, `dns`, `timeout`, `tls`, `connection_refused`, `connection_reset`, `redirect`, `network`) and printed once per kind to stderr. Any item left pending by an outage makes the run exit 1.
-- After 5 unavailable lookups in a row (`RESOLVE_MAX_CONSECUTIVE_UNAVAILABLE`) the run stops with exit 1. An item left pending 5 times (`RESOLVE_MAX_ATTEMPTS`) is skipped unless `--retry-failed` is passed.
-- A 4xx other than 401, 403 and 429 settles only that item, as `unresolved` with reason `bad_query`, and the run goes on. After 5 in a row (`RESOLVE_MAX_CONSECUTIVE_REFUSED`) it stops, so a wrong address cannot settle every item for good.
+- After 5 unavailable lookups in a row (`RESOLVE_MAX_CONSECUTIVE_UNAVAILABLE`) the run stops with exit 1.
+- An item that has been charged 5 attempts (`RESOLVE_MAX_ATTEMPTS`) is `exhausted`: it is not tried again unless `--retry-failed` is passed. Exhausted items are counted apart from skipped ones, and the command exits 1 while any exist, with a hint naming `--retry-failed`. A stuck item is never quiet.
+- A 4xx other than 401, 403 and 429 leaves that item `pending` and charges it one attempt, as above. It settles as `unresolved` with reason `bad_query` only when its attempts reach 5. The run goes on. After 5 refusals in a row (`RESOLVE_MAX_CONSECUTIVE_REFUSED`) it stops, so a wrong address or a 408 burns nothing for good.
 - A 401 or 403, an answer in an unknown shape, not JSON, or over 1 MB stops the run with exit 1. Nothing is cached for it.
 
-One run at a time: a run takes the `resolve-items` row of `job_locks` with one update, holds it for a 30-minute lease, refreshes it before each item, and frees it at the end or on SIGINT and SIGTERM. A second run exits 3 and changes nothing. A run that is killed with no chance to clean up frees the lock when its lease runs out.
+One run at a time: a run takes the `resolve-items` row of `job_locks` with one update, holds it for a 30-minute lease, refreshes it before each item and before every request to MusicBrainz (retries included), and frees it at the end or on SIGINT and SIGTERM. A second run exits 3 and changes nothing. A run that is killed with no chance to clean up frees the lock when its lease runs out.
 
 Flags: `--limit N` processes at most N items and prints how many remain. `--retry-failed` tries items that have failed 5 times or more.
 
-Exit codes: 0 done, 1 stopped or some items left pending by an outage, 2 bad setting or argument, 3 another run holds the lock.
+Exit codes: 0 done, 1 stopped, or some items left pending, or some items exhausted, 2 bad setting or argument, 3 another run holds the lock.
 
-Stdout is counts only: `new`, `total`, `resolved`, `unresolved`, `pending`, `skipped`, `remaining`, `requests`, `cache_hits`. Every item that was pending at the start is in exactly one of `resolved`, `unresolved`, `pending`, `skipped` and `remaining`, and `total` is their sum. Progress lines (`progress: 25 of 140 items`) go to stderr every 25 items. Nothing printed holds a name, a response or a key.
+Stdout is counts only: `new`, `total`, `resolved`, `unresolved`, `pending`, `skipped`, `exhausted`, `remaining`, `requests`, `cache_hits`. Every item that was pending at the start is in exactly one of `resolved`, `unresolved`, `pending`, `skipped`, `exhausted` and `remaining`, and `total` is their sum. Progress lines (`progress: 25 of 140 items`) go to stderr every 25 items. Nothing printed holds a name, a response or a key.
 
-Known design debt, decided when the Map is planned: an aliases table for several Spotify identifiers per item, track rows that point at their artist and album item ids, and reading only the plays newer than the last scan.
+Known design debt, decided when the Map is planned:
+
+- An aliases table for several Spotify identifiers per item.
+- Track rows that point at their artist and album item ids.
+- Two different artists with the same name share one row, because an artist's identity is its normalized name.
+- Lease times come from this computer's clock, not the database's.
+- Reading only the plays newer than the last scan.
 
 ## Local development
 

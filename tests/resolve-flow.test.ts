@@ -53,12 +53,17 @@ function except(prefix: string, reply: FetchReply | Fail, otherwise: Respond = n
   return (call, count) => (call.fields.recording?.startsWith(prefix) ? reply : otherwise(call, count));
 }
 
+/** Every item that was pending at the start lands in exactly one count. */
+function expectPartition(counts: ReturnType<typeof emptyResolveCounts>): void {
+  expect(counts.resolved + counts.unresolved + counts.pending + counts.skipped + counts.exhausted + counts.remaining).toBe(counts.total);
+}
+
 beforeEach(async () => {
   await clearTables(db);
 });
 
 describe("counts", () => {
-  it("puts every item in exactly one count: resolved, unresolved, pending or skipped", async () => {
+  it("puts every item in exactly one count: resolved, unresolved, pending, skipped, exhausted or remaining", async () => {
     await seedPlays(db, [
       T1,
       play(10, { track: "SYNTH Nothing Here", artist: "SYNTH Artist N" }),
@@ -76,8 +81,9 @@ describe("counts", () => {
 
     expect(outcome).toBeUndefined();
     // track, album and artist of the first play settle; the track with no hit, and the artists D, N and E, are unresolved.
-    expect(counts).toMatchObject({ new: 8, total: 10, resolved: 3, unresolved: 4, pending: 1, skipped: 2, remaining: 0 });
-    expect(counts.resolved + counts.unresolved + counts.pending + counts.skipped + counts.remaining).toBe(counts.total);
+    // The orphan is skipped: no play names it. The capped one is exhausted: it has failed as often as allowed.
+    expect(counts).toMatchObject({ new: 8, total: 10, resolved: 3, unresolved: 4, pending: 1, skipped: 1, exhausted: 1, remaining: 0 });
+    expectPartition(counts);
     const rows = await items(db);
     expect(rows).toHaveLength(10);
     expect(rows.filter((row) => row.state === "pending")).toHaveLength(3); // down, capped, orphan
@@ -88,8 +94,33 @@ describe("counts", () => {
 
     const { counts, calls } = await run(fromCatalog(SMALL));
 
-    expect(counts).toMatchObject({ total: 3, resolved: 3, unresolved: 0, pending: 0, skipped: 0, remaining: 0, requests: 2 });
+    expect(counts).toMatchObject({ total: 3, resolved: 3, unresolved: 0, pending: 0, skipped: 0, exhausted: 0, remaining: 0, requests: 2 });
     expect(calls.map((call) => call.path.split("/").at(-1))).toEqual(["recording", "release-group"]);
+  });
+
+  it("counts a credit-settled artist that another run settled first as skipped, so the counts add up and nothing is left remaining", async () => {
+    await seedPlays(db, [T1]);
+    let beats = 0;
+
+    const { counts, outcome } = await run(fromCatalog(SMALL), {
+      heartbeat: async () => {
+        beats += 1;
+        // Before the first item: another run settles the artist. This run still holds its old view of the row.
+        if (beats === 1) {
+          const { error } = await db
+            .from("items")
+            .update({ state: "resolved", mbid: id(88), resolved_at: new Date().toISOString() })
+            .eq("kind", "artist")
+            .eq("state", "pending");
+          if (error) throw new Error(`could not settle the artist: ${error.code}`);
+        }
+      },
+    });
+
+    expect(outcome).toBeUndefined();
+    expect(counts).toMatchObject({ total: 3, resolved: 2, unresolved: 0, pending: 0, skipped: 1, exhausted: 0, remaining: 0 });
+    expectPartition(counts);
+    expect(find(await items(db), "artist", T1.artist)).toMatchObject({ state: "resolved", mbid: id(88) });
   });
 
   it("reports the requests and cache hits of the run", async () => {
@@ -191,7 +222,7 @@ describe("outages", () => {
     expect(find(rows, "track", T1.track)).toMatchObject({ state: "resolved", attempts: 0, last_attempt_at: null });
   });
 
-  it("stops after RESOLVE_MAX_CONSECUTIVE_UNAVAILABLE unavailable results in a row, and says how many items are left", async () => {
+  it("stops after RESOLVE_MAX_CONSECUTIVE_UNAVAILABLE unavailable results in a row, says how many items are left, and charges no item", async () => {
     expect(RESOLVE_MAX_CONSECUTIVE_UNAVAILABLE).toBe(5);
     await seedPlays(db, Array.from({ length: 12 }, (_, index) => play(index + 1, { track: `SYNTH Down ${index + 1}` })));
 
@@ -200,10 +231,52 @@ describe("outages", () => {
     expect(outcome).toBeInstanceOf(UserError);
     expect((outcome as UserError).message).toMatch(/MusicBrainz/);
     expect(calls).toHaveLength(5 * 3);
-    expect(counts).toMatchObject({ total: 13, pending: 5, remaining: 8 });
+    expect(counts).toMatchObject({ total: 13, pending: 5, remaining: 8, exhausted: 0 });
+    expectPartition(counts);
+    // An outage says nothing about the item that happened to be asked: the one that tripped the stop, and the four before it, are not charged.
     const rows = await items(db);
-    expect(rows.filter((row) => row.attempts === 1)).toHaveLength(5);
-    expect(rows.filter((row) => row.attempts === 0)).toHaveLength(8);
+    expect(rows.every((row) => row.attempts === 0 && row.last_attempt_at === null)).toBe(true);
+  });
+
+  it("never exhausts the same items by outage: five runs that each stop on an outage leave every attempt count at zero", async () => {
+    await seedPlays(db, Array.from({ length: 12 }, (_, index) => play(index + 1, { track: `SYNTH Down ${index + 1}` })));
+
+    for (let attempt = 1; attempt <= RESOLVE_MAX_ATTEMPTS; attempt += 1) {
+      const { outcome, counts } = await run(() => ({ status: 503 }));
+      expect(outcome, `run ${attempt}`).toBeInstanceOf(UserError);
+      expect(counts.exhausted).toBe(0);
+    }
+
+    const rows = await items(db);
+    expect(rows.every((row) => row.state === "pending" && row.attempts === 0)).toBe(true);
+
+    // The sixth run, with MusicBrainz back, still reaches every item.
+    const up = await run(nothing);
+    expect(up.outcome).toBeUndefined();
+    expect(up.counts).toMatchObject({ total: 13, unresolved: 13, exhausted: 0, remaining: 0 });
+  });
+
+  it("charges an item only once MusicBrainz has answered another lookup, and not an item that failed at the end of an outage", async () => {
+    await seedPlays(db, [play(1, { track: "SYNTH Down 1" }), play(2, { track: "SYNTH Up 2" }), play(3, { track: "SYNTH Down 3" })]);
+
+    await run(except("SYNTH Down", { status: 503 }));
+
+    const rows = await items(db);
+    // Down 1 failed, then Up 2 was answered: the failure was the item's own, so it is charged.
+    expect(find(rows, "track", "SYNTH Down 1").attempts).toBe(1);
+    // The artist search that follows is answered too, so Down 3 is charged as well.
+    expect(find(rows, "track", "SYNTH Down 3").attempts).toBe(1);
+  });
+
+  it("does not charge an item that fails last in a run with no answer after it", async () => {
+    await seedPlays(db, [play(1, { track: "SYNTH Up 1", artist: "  " }), play(2, { track: "SYNTH Down 2", artist: "SYNTH Artist D" })]);
+
+    // The artist search of Artist D is down too, so nothing answers after the failing track.
+    const { counts } = await run((call, count) => (call.fields.recording || call.fields.artist ? { status: 503 } : nothing(call, count)));
+
+    const rows = await items(db);
+    expect(find(rows, "track", "SYNTH Down 2")).toMatchObject({ state: "pending", attempts: 0 });
+    expect(counts.pending).toBe(2);
   });
 
   it("does not stop when a good answer breaks the run of failures", async () => {
@@ -235,28 +308,46 @@ describe("outages", () => {
     expect(counts.pending).toBe(5);
   });
 
-  it("skips an item that has failed RESOLVE_MAX_ATTEMPTS times, unless --retry-failed is passed", async () => {
+  it("counts an item that has failed RESOLVE_MAX_ATTEMPTS times as exhausted, never as skipped, unless --retry-failed is passed", async () => {
     await seedPlays(db, [T1]);
     await db.from("items").insert({ kind: "track", name: T1.track, source_key: T1.uri, attempts: RESOLVE_MAX_ATTEMPTS });
 
     const skipped = await run(fromCatalog(SMALL));
-    // The album settles. The track is skipped, so the artist has no credit to settle from and is searched, and unmatched.
-    expect(skipped.counts).toMatchObject({ skipped: 1, resolved: 1, unresolved: 1 });
+    // The album settles. The track is exhausted, so the artist has no credit to settle from and is searched, and unmatched.
+    expect(skipped.counts).toMatchObject({ skipped: 0, exhausted: 1, resolved: 1, unresolved: 1 });
+    expectPartition(skipped.counts);
     expect(skipped.calls.some((call) => call.path.endsWith("/recording"))).toBe(false);
     expect(find(await items(db), "track", T1.track).state).toBe("pending");
 
     const retried = await run(fromCatalog(SMALL), { retryFailed: true });
-    expect(retried.counts).toMatchObject({ skipped: 0, resolved: 1 });
+    expect(retried.counts).toMatchObject({ skipped: 0, exhausted: 0, resolved: 1 });
     expect(find(await items(db), "track", T1.track).state).toBe("resolved");
   });
 
-  it("keeps counting attempts on a retried item that is still down", async () => {
+  it("counts an item as exhausted in the run in which it reaches the limit, and tries it no more until --retry-failed", async () => {
+    await seedPlays(db, [T1]);
+    await db.from("items").insert({ kind: "track", name: T1.track, source_key: T1.uri, attempts: RESOLVE_MAX_ATTEMPTS - 1 });
+
+    // The track is down, and the album that follows is answered, so the failure was the track's own.
+    const reached = await run(except(T1.track, { status: 503 }, fromCatalog(SMALL)));
+    expect(reached.counts).toMatchObject({ pending: 0, exhausted: 1 });
+    expectPartition(reached.counts);
+    expect(find(await items(db), "track", T1.track)).toMatchObject({ state: "pending", attempts: RESOLVE_MAX_ATTEMPTS });
+
+    const after = await run(fromCatalog(SMALL));
+    expect(after.counts.exhausted).toBe(1);
+    expect(after.calls.some((call) => call.fields.recording === T1.track)).toBe(false);
+  });
+
+  it("keeps counting attempts on a retried item that is still down, and keeps it exhausted", async () => {
     await seedPlays(db, [T1]);
     await db.from("items").insert({ kind: "track", name: T1.track, source_key: T1.uri, attempts: RESOLVE_MAX_ATTEMPTS });
 
-    await run(() => ({ status: 503 }), { retryFailed: true });
+    const { counts } = await run(except(T1.track, { status: 503 }, fromCatalog(SMALL)), { retryFailed: true });
 
     expect(find(await items(db), "track", T1.track).attempts).toBe(RESOLVE_MAX_ATTEMPTS + 1);
+    expect(counts.exhausted).toBe(1);
+    expectPartition(counts);
   });
 
   it("settles pending items on a later run when MusicBrainz is back", async () => {
@@ -274,7 +365,7 @@ describe("outages", () => {
 });
 
 describe("a bad item does not stop the run", () => {
-  it("settles an item MusicBrainz refuses (a 400) as unresolved with reason bad_query, and goes on", async () => {
+  it("leaves an item MusicBrainz refuses (a 400) pending with one attempt, never settling it on first sight, and goes on", async () => {
     await seedPlays(db, [T1, play(2, { track: "SYNTH Refused" })]);
     const catalog = fromCatalog(SMALL);
 
@@ -282,10 +373,45 @@ describe("a bad item does not stop the run", () => {
 
     expect(outcome).toBeUndefined();
     const rows = await items(db);
-    expect(find(rows, "track", "SYNTH Refused")).toMatchObject({ state: "unresolved", reason: "bad_query", mbid: null, match_score: null });
+    expect(find(rows, "track", "SYNTH Refused")).toMatchObject({ state: "pending", reason: null, mbid: null, attempts: 1 });
+    expect(find(rows, "track", "SYNTH Refused").last_attempt_at).not.toBeNull();
     expect(find(rows, "track", T1.track).state).toBe("resolved");
-    expect(counts.unresolved).toBeGreaterThanOrEqual(1);
+    expect(counts.pending).toBe(1);
+    expectPartition(counts);
     expect(calls.filter((call) => call.fields.recording === "SYNTH Refused")).toHaveLength(1);
+  });
+
+  it("settles a refused item as unresolved bad_query only when its attempts reach RESOLVE_MAX_ATTEMPTS", async () => {
+    await seedPlays(db, [play(1, { track: "SYNTH Refused" })]);
+
+    for (let attempt = 1; attempt <= RESOLVE_MAX_ATTEMPTS; attempt += 1) {
+      // A good item that follows each time, so MusicBrainz is seen to answer and the refusal is the item's own.
+      await seedPlays(db, [play(100 + attempt, { track: `SYNTH Fine ${attempt}`, artist: "SYNTH Artist F" })]);
+      const { counts } = await run(except("SYNTH Refused", { status: 400, body: { error: "synthetic" } }));
+
+      const refused = find(await items(db), "track", "SYNTH Refused");
+      if (attempt < RESOLVE_MAX_ATTEMPTS) {
+        expect(refused, `run ${attempt}`).toMatchObject({ state: "pending", attempts: attempt, reason: null });
+        expect(counts.pending, `run ${attempt}`).toBe(1);
+      } else {
+        expect(refused).toMatchObject({ state: "unresolved", reason: "bad_query", mbid: null });
+        expect(counts.pending).toBe(0);
+        expectPartition(counts);
+      }
+    }
+  });
+
+  it("burns nothing for good when the address is wrong or the answer is a 408: no attempt is charged and no item is settled", async () => {
+    for (const status of [404, 408]) {
+      await clearTables(db);
+      await seedPlays(db, Array.from({ length: 9 }, (_, index) => play(index + 1)));
+
+      const { outcome } = await run(() => ({ status }));
+
+      expect(outcome, `status ${status}`).toBeInstanceOf(UserError);
+      const rows = await items(db);
+      expect(rows.every((row) => row.state === "pending" && row.attempts === 0 && row.reason === null), `status ${status}`).toBe(true);
+    }
   });
 
   it("stops the run on a 401 or a 403, leaving the item pending", async () => {
@@ -301,7 +427,7 @@ describe("a bad item does not stop the run", () => {
     }
   });
 
-  it("stops after RESOLVE_MAX_CONSECUTIVE_REFUSED refusals in a row, so a wrong address cannot settle every item for good", async () => {
+  it("stops after RESOLVE_MAX_CONSECUTIVE_REFUSED refusals in a row, so a wrong address cannot settle or charge any item", async () => {
     expect(RESOLVE_MAX_CONSECUTIVE_REFUSED).toBe(5);
     await seedPlays(db, Array.from({ length: 9 }, (_, index) => play(index + 1)));
 
@@ -309,7 +435,9 @@ describe("a bad item does not stop the run", () => {
 
     expect(outcome).toBeInstanceOf(UserError);
     expect(calls).toHaveLength(5);
-    expect(counts).toMatchObject({ unresolved: 5, remaining: 5 });
+    expect(counts).toMatchObject({ unresolved: 0, pending: 5, remaining: 5 });
+    expectPartition(counts);
+    expect((await items(db)).every((row) => row.state === "pending" && row.attempts === 0)).toBe(true);
   });
 
   it("makes no request for a name over MB_MAX_NAME_LENGTH, and settles it as name_too_long", async () => {
@@ -392,6 +520,34 @@ describe("matching safety", () => {
     await run(track(hit({ artists: [{ id: artistA.id, name: "SYNTH Artist A (stylized)" }] })));
 
     expect(find(await items(db), "track", T1.track)).toMatchObject({ state: "resolved", mbid: id(21) });
+  });
+
+  it("refuses a remix, and a hit that credits the played artist only as a guest, even at a score of 95", async () => {
+    await seedPlays(db, [{ ...T1, album: null }]);
+
+    await run(track(hit({ score: 95, title: "SYNTH Song One (SYNTH Other Remix)" })));
+    expect(find(await items(db), "track", T1.track)).toMatchObject({
+      state: "unresolved",
+      reason: "no_match",
+      mbid: null,
+      match_score: 95,
+      matched_name: "SYNTH Song One (SYNTH Other Remix)",
+    });
+
+    await clearTables(db);
+    await seedPlays(db, [{ ...T1, album: null }]);
+    await run(track(hit({ score: 95, artists: [{ id: id(99), name: "SYNTH Main Act" }, artistA] })));
+    expect(find(await items(db), "track", T1.track)).toMatchObject({ state: "unresolved", reason: "no_match", mbid: null, match_score: 95 });
+  });
+
+  it("accepts a hit that credits the played artist first and a guest after, and settles the artist from the first credit", async () => {
+    await seedPlays(db, [{ ...T1, album: null }]);
+
+    await run(track(hit({ artists: [artistA, { id: id(99), name: "SYNTH Guest" }] })));
+
+    const rows = await items(db);
+    expect(find(rows, "track", T1.track)).toMatchObject({ state: "resolved", mbid: id(21) });
+    expect(find(rows, "artist", T1.artist)).toMatchObject({ state: "resolved", mbid: artistA.id, reason: "credit" });
   });
 
   it("records ambiguous, and settles nothing, when two different IDs both score at or above the threshold", async () => {
