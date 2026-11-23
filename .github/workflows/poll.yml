@@ -15,8 +15,10 @@ concurrency:
 
 jobs:
   poll:
-    # Only the main branch of this repository. A fork, or a manual run from another branch, never gets the secrets.
-    if: github.repository == 'hannasage/hanna-fm-ingest' && github.ref == 'refs/heads/main'
+    # The five secrets live in this environment. Hanna limits it to the main branch,
+    # so a manual run from any other branch cannot read them. Scheduled runs start only
+    # from the default branch, and forks do not run them.
+    environment: production
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -27,7 +29,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
-          cache: npm
 
       - run: npm ci
 
