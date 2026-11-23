@@ -122,7 +122,13 @@ To compare the copy with the site, run:
 HANNA_FM_PATH=../hanna-fm npm run schema:check
 ```
 
-It checks the manifest, and the site clone when `HANNA_FM_PATH` is set. CI cannot do the site comparison: the site repository is private, and CI cannot read it. CI runs the manifest check through the tests only. A CI diff against the site becomes possible once the site repository is public.
+It checks the manifest, and the site clone when `HANNA_FM_PATH` is set.
+
+CI runs the site comparison too. The site repository is public, so the `gates` workflow (on every pull request and every push to `main`) shallow-clones `hanna-fm` main into a temp folder, with no token, and runs `schema:check` with `HANNA_FM_PATH` pointing at it. Any difference fails the job with: "the vendored migrations differ from hanna-fm main; run schema:sync". The fix is to run `schema:sync` against a current site clone and commit the result.
+
+**The site pull request merges first.** A pull request here that adds or changes a migration cannot pass the comparison until the same file is on the site's main. Open the site pull request, merge it, then re-run CI here. The comparison also fails when the site's main has a migration this copy lacks, so a drift shows up on the next pull request.
+
+What the tests prove and what only CI proves: the tests parse `ci.yml`, run the step's script with a stand-in for `git clone`, and check that a matching copy passes and that a changed, extra or missing file fails with the message. Only a real CI run proves that the anonymous clone of `hanna-fm` works from GitHub's runners.
 
 ## Make your own
 
