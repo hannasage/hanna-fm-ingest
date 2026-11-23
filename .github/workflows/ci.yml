@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      # A local Supabase stack from the Supabase CLI. Migrations and the
+      # synthetic seed file load on start. Keys stay in the job's memory:
+      # the tests read them from `supabase status` and nothing prints them.
+      - uses: supabase/setup-cli@1dedf2c611547ede7232d26866dd3c56ab903bbb # v1.7.3
+        with:
+          version: 3.0.0
+
+      - name: Start local Supabase
+        # The output goes to a file, because it prints keys. On failure, show the
+        # last 50 lines with every line that could hold a key, token or secret removed.
+        run: |
+          if ! supabase start > "$RUNNER_TEMP/supabase-start.log" 2>&1; then
+            echo "supabase start failed. Last 50 lines, with key, token and secret lines removed:"
+            tail -n 50 "$RUNNER_TEMP/supabase-start.log" | grep -viE 'key|token|secret|password|jwt|bearer|eyJ' || true
+            exit 1
+          fi
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Stop local Supabase
+        if: always()
+        run: supabase stop --no-backup
