@@ -72,7 +72,7 @@ async function readCapped(response: Response): Promise<string> {
 }
 
 /** Sends one request. Any network failure, timeout or redirect becomes the one network message. */
-async function send(url: string, init: RequestInit): Promise<Answer> {
+export async function send(url: string, init: RequestInit): Promise<Answer> {
   let response: Response;
   try {
     response = await fetch(url, {
@@ -106,7 +106,7 @@ function retryHint(headers: Headers): string | null {
   return value !== null && /^\d{1,7}$/.test(value) ? value : null;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 

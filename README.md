@@ -2,7 +2,7 @@
 
 The data side of hanna.fm. It polls Spotify every 30 minutes, imports Spotify's Extended Streaming History export, resolves items to MusicBrainz IDs, and builds the derived data the site shows.
 
-Status: in development. The export importer, the poller, item identity and the poll run records are built.
+Status: in development. The export importer, the poller, item identity, the poll run records and the Spotify login helper are built.
 
 ## Rules for every commit
 
@@ -137,6 +137,41 @@ Run it again after each new authorization. It is safe to run twice: one key keep
 `set-state` trusts what it is given. It can write a recent date for a login that is really old, and so hide a true expiry: the reminder and the site then count from the date written. Write the date of the real authorization and no other. Only a person who holds the secret key (`SUPABASE_SECRET_KEY`) can run it, because the table refuses the browser roles.
 
 A bad argument exits 2 with one plain line and stores nothing. A database failure exits 1. The command prints only `Recorded spotify_authorized_at.` on success. It never prints the value or any secret.
+
+## Get a Spotify refresh token (Hanna)
+
+`spotify-login` runs the Spotify login once and prints a refresh token. Run it on your own computer, in a terminal, because it uses the app's client secret.
+
+1. In a terminal, export the two values. They come from the Spotify app's settings page:
+
+   ```
+   export SPOTIFY_CLIENT_ID=...
+   export SPOTIFY_CLIENT_SECRET=...
+   ```
+
+   Never pass them as arguments, and never paste them into chat. The command reads them from the environment only, and refuses any argument.
+2. Optional: to record the login date at the same time, also export `SUPABASE_URL` and `SUPABASE_SECRET_KEY`.
+3. Run `npm run spotify-login`.
+4. It prints an address. Open it in your own browser (the command never opens one), sign in to Spotify, and approve.
+5. The browser returns to `http://127.0.0.1:8765/callback`. The command then prints the granted scopes and one line, `SPOTIFY_REFRESH_TOKEN=<token>`.
+6. Copy the token (the part after `=`) into this repository's `production` environment secret `SPOTIFY_REFRESH_TOKEN`. Never paste it into chat, a file or a pull request. Then clear the terminal.
+
+The redirect address `http://127.0.0.1:8765/callback` is `SPOTIFY_REDIRECT_URI` in `src/settings.ts`. It must match, character for character, the redirect URI registered in the Spotify app. Spotify refuses `localhost` there, so it is the IP address. To use another port, set `SPOTIFY_LOGIN_PORT` (1024 to 65535) and register the redirect URI with that port in the Spotify app as well.
+
+What it does:
+
+- Listens on `127.0.0.1` only, for one request to `/callback`, then closes. Any other path gets 404. It gives up after 5 minutes (exit 1).
+- Makes a random `state` of 256 bits for each run and refuses a callback with a missing or wrong one (exit 1).
+- A refusal in the browser (`access_denied`, or any `error`) exits 1 with a plain message.
+- Trades the code for tokens with Spotify's token endpoint, using Basic client authentication and a form body. The access token is never printed or stored.
+- Asks for the scopes in `LOGIN_SCOPES` (`src/settings.ts`): `user-read-recently-played` (the poller), `user-read-currently-playing` (a later Now playing strip) and `playlist-read-private` (a later playlist picker). It prints the scopes Spotify granted.
+- Prints the refresh token only when stdout is an interactive terminal. In a pipe, a file or a CI job it exits 2 before it starts, so a token never lands in a log.
+- With `SUPABASE_URL` and `SUPABASE_SECRET_KEY` set, it records `spotify_authorized_at` (today, in UTC) the same way `set-state` does. If that fails it prints a note with the `set-state` command to run, and still exits 0.
+- Never prints the client secret, the code or any response body. Redirects are refused and each request times out. `SPOTIFY_ACCOUNTS_BASE` (tests only) follows the same address rule as the poll.
+
+Exit codes: 0 done, 1 the login did not finish (refused, timed out, wrong state, a Spotify error, a busy port), 2 a bad setting, an argument, or output that is not a terminal.
+
+Renew the login every six months. A refresh token lasts 6 months from authorization, and refreshing does not extend it. Run `spotify-login` again before then, replace the `SPOTIFY_REFRESH_TOKEN` secret, and let the command record the new date. The poll warns from day 150.
 
 ## Set up the scheduled poll (Hanna)
 

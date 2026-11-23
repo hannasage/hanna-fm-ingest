@@ -17,7 +17,7 @@ export type CliResult = {
  * Runs the real command in a child process, the way a person would.
  * Pass `env` to replace the connection values. An undefined value removes the variable.
  */
-function prepare(
+export function prepare(
   command: string,
   args: string[],
   env: Record<string, string | undefined>,
@@ -112,6 +112,14 @@ export function runImport(
   env: Record<string, string | undefined> = {},
 ): CliResult {
   return run("import-export", path === undefined ? [] : [path], env);
+}
+
+/** Runs `spotify-login` with its stdout and stderr on pipes, which is not an interactive terminal. */
+export function runSpotifyLogin(
+  args: string[] = [],
+  env: Record<string, string | undefined> = {},
+): CliResult {
+  return run("spotify-login", args, env);
 }
 
 /** Runs `set-state <key> <value>`. Pass `env` to replace the connection values. */
