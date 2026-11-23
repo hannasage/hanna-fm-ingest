@@ -2,7 +2,7 @@
 
 The data side of hanna.fm. It polls Spotify every 30 minutes, imports Spotify's Extended Streaming History export, resolves items to MusicBrainz IDs, and builds the derived data the site shows.
 
-Status: in development. The export importer and item identity are built.
+Status: in development. The export importer, the poller and item identity are built.
 
 ## Rules for every commit
 
@@ -41,6 +41,72 @@ Other behavior:
 - `SUPABASE_URL` must be https, unless the host is `localhost` or `127.0.0.1`. Otherwise the command exits 2 before it sends the key.
 
 The key names the importer reads are in one table, `src/mapping.ts`. Ticket 7 checks them against a real export.
+
+## Poll Spotify
+
+```
+export SUPABASE_URL=... SUPABASE_SECRET_KEY=...
+export SPOTIFY_CLIENT_ID=... SPOTIFY_CLIENT_SECRET=... SPOTIFY_REFRESH_TOKEN=...
+npm run poll
+```
+
+One run trades the refresh token for an access token, asks Spotify's recently-played call for plays after the latest stored end time, and stores each new one with source `poll` and no play length (`ms_played` is null). It prints counts only: `fetched`, `stored`, `duplicate` (split into `duplicate_export` and `duplicate_exact`), and `skipped` by reason (`no_track`, `malformed`). `fetched` always equals `stored` + `duplicate` + `skipped`.
+
+Paging:
+
+- A page holds at most 50 plays. When a full page comes back, the poll pages back with `before` (the oldest play time on the page) until a page holds only plays at or before the stored cursor, or is shorter than 50, or is empty. Spotify refuses `after` and `before` together, so only the first page uses `after`.
+- At most `POLL_MAX_PAGES` pages are read (20, in `src/settings.ts`). Hitting that limit stores what was fetched, prints `possible_gap: true`, and exits 1. `possible_gap` is printed only in that case, and when Spotify gives no older page to go back to.
+
+Repeats:
+
+- `duplicate_export`: the same track has a stored play from an export within `DEDUPE_WINDOW_SECONDS` (10, in `src/settings.ts`) of it, on either side. Only export rows are checked this way.
+- `duplicate_exact`: the table's exact key (track and end time) already holds the play, or the answer holds it twice. A poll row is told apart by its exact key alone, so a replay of a short track is kept.
+
+Exit 1 (with a `::error::` annotation for the first three):
+
+- Every fetched item was skipped and at least one is malformed, so nothing was stored by mistake (a renamed field looks like this).
+- Any item that is not clearly a local file or an episode and cannot be read as a track is malformed. That includes a missing `track` object, a missing `type`, and a missing or bad `uri`.
+- Any item is malformed. The valid plays are stored first.
+- The page limit was reached, or Spotify gave no older page.
+- The newest stored play is more than 60 seconds ahead of the clock. The poll names the problem and stops before it uses the login. Fix or delete that row.
+- A rejected or expired login, 401, 403, 429 (with the retry hint when Spotify sends one), malformed JSON, a response over 1 MB, a page of more than 50 items, and any network failure. No message holds a token, a key or a response body.
+
+Exit 0 with a plain note on stderr: every fetched item was a local file (`is_local` is true) or an episode (`type` is `episode`), the only two things the poll skips as `no_track`, so nothing was stored and nothing is malformed. A window like that is normal, and it stays green until a real play appears.
+
+Limits on what Spotify sends: a play stamped more than 60 seconds in the future, or a track, artist or album text over 500 characters, is malformed. A response body over 1 MB is refused. The limits are named in `src/settings.ts`.
+
+Other behavior:
+
+- A new refresh token in Spotify's answer prints `::warning::Spotify issued a new refresh token. Re-authorize and store the new token.` The poll never prints the token. Store the new one as the `SPOTIFY_REFRESH_TOKEN` secret.
+- `SPOTIFY_ACCOUNTS_BASE` and `SPOTIFY_API_BASE` are optional and for tests. They may name only `https://accounts.spotify.com` and `https://api.spotify.com`, or `localhost` or `127.0.0.1`. Any other address exits 2 before anything is sent, because the login travels to it.
+- Spotify refresh tokens last 6 months from authorization, and refreshing does not extend that. Renew the login before then.
+- `played_at` may be the start of a play, not the end. It is stored as `ended_at` until ticket 7 measures it.
+
+## Set up the scheduled poll (Hanna)
+
+`.github/workflows/poll.yml` runs the poll every 30 minutes the moment it reaches `main`. Before it merges:
+
+1. Merge the site repository's pull request with the `poll_plays` migration first, and apply it to the production database. The poll cannot store a play without it.
+2. In this repository's settings, create an environment named `production`. Limit its deployment branches to `main`. Then a manual run from any other branch cannot read the secrets.
+3. Add the five secrets to that environment, not to the repository: `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_REFRESH_TOKEN`. Delete any copy at repository level.
+4. Protect `main` (pull request and checks required), so a change to the workflow cannot skip review. `.github/CODEOWNERS` gives `.github/` to `@hannasage`. Turn on "Require review from Code Owners" for it to bind.
+
+Scheduled runs start only from the default branch, and forks do not run them.
+
+## Keep the scheduled poll switched on
+
+This repository is public. GitHub's documentation for the `schedule` event says: "In a public repository, scheduled workflows are automatically disabled when no repository activity has occurred in 60 days." The poll is a scheduled workflow, so it can be switched off this way.
+
+`.github/workflows/keepalive.yml` runs once a month (06:23 UTC on the 1st) and by hand. It calls GitHub's documented "Enable a workflow" endpoint for `poll.yml`, reads the workflow's state back, and fails the run unless the state is `active`. It has the `actions: write` permission and nothing else, uses no secret and no action. It runs only the `gh` program that GitHub-hosted runners carry. A failed run shows red and sends GitHub's usual failure email.
+
+What is verified and what is not:
+
+- Verified from the docs: the 60-day rule; the endpoint (`PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/enable`), which "enables a workflow and sets the state of the workflow to active" and needs the Actions write permission. Verified by a real call: the endpoint returns 204 for a workflow that is already active, so the monthly call does not fail on a healthy one.
+- Unverified: the docs do not say that re-enabling resets the 60-day clock, and they do not say what counts as repository activity. So the keepalive is a best effort, not a proven guard. It is also a scheduled workflow itself, so the same rule applies to it.
+- Fallback 1: the site's poller-health check (a later ticket) warns when no poll has run.
+- Fallback 2: a person re-enables the workflow by hand: Actions tab, `poll`, "Enable workflow", or `gh workflow enable poll.yml`.
+
+Merging this branch starts both schedules. Do it only after the setup steps above.
 
 ## Resolve items
 

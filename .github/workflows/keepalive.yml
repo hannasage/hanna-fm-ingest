@@ -1,0 +1,41 @@
+name: keepalive
+
+# GitHub's docs say that in a public repository, scheduled workflows are automatically disabled
+# when no repository activity has occurred in 60 days. Once a month this workflow turns poll.yml
+# back on through the documented "Enable a workflow" endpoint, then reads the state back and fails
+# the run unless it is "active". It uses no action and no secret: only the `gh` program that
+# GitHub-hosted runners already carry, and the job's own token.
+#
+# Unverified: the docs do not say that re-enabling resets the 60-day clock, or what counts as
+# activity. This workflow is itself scheduled, so the same rule applies to it. The README names
+# the fallback.
+
+on:
+  schedule:
+    - cron: "23 6 1 * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Re-enable poll.yml and check that it is active
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api --method PUT "repos/$REPO/actions/workflows/poll.yml/enable" || {
+            echo "::error::The call that re-enables poll.yml failed. Enable it by hand in the Actions tab."
+            exit 1
+          }
+          state=$(gh api "repos/$REPO/actions/workflows/poll.yml" --jq .state)
+          if [ "$state" != "active" ]; then
+            echo "::error::poll.yml is not active after the enable call (state: $state). Enable it by hand in the Actions tab."
+            exit 1
+          fi
+          echo "poll.yml is active."

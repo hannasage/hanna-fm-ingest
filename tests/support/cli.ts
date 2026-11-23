@@ -28,6 +28,11 @@ function prepare(
     // A value in the shell that runs the tests must not reach the command by accident.
     MB_USER_AGENT: undefined,
     MB_API_BASE: undefined,
+    SPOTIFY_CLIENT_ID: undefined,
+    SPOTIFY_CLIENT_SECRET: undefined,
+    SPOTIFY_REFRESH_TOKEN: undefined,
+    SPOTIFY_ACCOUNTS_BASE: undefined,
+    SPOTIFY_API_BASE: undefined,
     SUPABASE_URL: url,
     SUPABASE_SECRET_KEY: key,
     ...env,
@@ -139,4 +144,19 @@ export function counts(stdout: string): Record<string, number> {
     if (match?.[1] && match[2]) found[match[1]] = Number(match[2]);
   }
   return found;
+}
+
+/**
+ * Runs `poll` without blocking. It must not block: the fake Spotify server runs in this
+ * same process, and a blocked process cannot answer it.
+ * The Spotify names start unset, so a test sets only what it means to.
+ */
+export function runPoll(
+  env: Record<string, string | undefined> = {},
+  extraArgs: string[] = [],
+): Promise<CliResult> {
+  const running = start("poll", extraArgs, env);
+  // A poll that hangs must not hang the test run.
+  const timer = setTimeout(() => running.stop("SIGKILL"), 120_000);
+  return running.done.finally(() => clearTimeout(timer));
 }

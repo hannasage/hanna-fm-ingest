@@ -32,7 +32,6 @@ function main(): void {
   mkdirSync(target, { recursive: true });
   for (const name of files) copyFileSync(join(source, name), join(target, name));
   writeFileSync(manifestPath(process.cwd()), `${JSON.stringify(buildManifest(process.cwd()), null, 2)}\n`);
-  writeFileSync(manifestPath(process.cwd()), `${JSON.stringify(buildManifest(process.cwd()), null, 2)}\n`);
   process.stdout.write(`Copied ${files.length} migration${files.length === 1 ? "" : "s"}:\n${files.map((f) => `  ${f}`).join("\n")}\n`);
 }
 

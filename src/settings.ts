@@ -10,6 +10,35 @@ export const MAX_FILE_BYTES = 500 * 1024 * 1024;
 export const BATCH_SIZE = 500;
 
 /**
+ * A poll play counts as one already stored when the same track has a stored end time within
+ * this many seconds of it, either side (the edge counts). This is in addition to the table's
+ * exact-match key. Ticket 7 measures the right window with real data.
+ */
+export const DEDUPE_WINDOW_SECONDS = 10;
+
+/** How many plays one poll asks Spotify for. 50 is the most the endpoint gives. */
+export const POLL_LIMIT = 50;
+
+/** How long one Spotify request may take before the poll gives up. */
+export const SPOTIFY_TIMEOUT_MS = 30_000;
+
+/** Where Spotify's token and API calls go, unless a test points the poll elsewhere. */
+export const DEFAULT_SPOTIFY_ACCOUNTS_BASE = "https://accounts.spotify.com";
+export const DEFAULT_SPOTIFY_API_BASE = "https://api.spotify.com/v1";
+
+/** The most pages one poll reads. A page holds up to POLL_LIMIT plays. Reaching this is a failure, not a quiet stop. */
+export const POLL_MAX_PAGES = 20;
+
+/** The most bytes the poll reads from one Spotify response: 1 MB. A larger one is refused. */
+export const MAX_RESPONSE_BYTES = 1024 * 1024;
+
+/** The most characters a track, artist or album name may hold. A longer one makes the item malformed. */
+export const MAX_TEXT_CHARS = 500;
+
+/** A play stamped more than this many seconds ahead of the clock is malformed. */
+export const FUTURE_TOLERANCE_SECONDS = 60;
+
+/**
  * A MusicBrainz match counts only when MusicBrainz's own score, 0 to 100, is at least this.
  * A lower score leaves the item unresolved. The score and the matched name are stored either way.
  */
