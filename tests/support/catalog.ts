@@ -4,7 +4,7 @@ import { id, T1 } from "./data.ts";
 type Credit = { id: string; name: string };
 type TrackHit = { id: string; score: number; title: string; artists: Credit[] };
 type AlbumHit = { id: string; score: number; title: string; artists?: Credit[] };
-type ArtistHit = { id: string; score: number; name: string };
+type ArtistHit = { id: string; score: number; name: string; aliases?: string[] };
 const many = <T>(value: T | T[] | undefined): T[] => (value === undefined ? [] : Array.isArray(value) ? value : [value]);
 
 /** A table of synthetic hits by the searched name. A value may be one hit or several, best first. */

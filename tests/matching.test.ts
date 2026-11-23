@@ -40,7 +40,7 @@ describe("parseCandidates", () => {
     const upper = ID.toUpperCase();
     const asText = parseCandidates({ artists: [{ id: upper, score: "95", name: "SYNTH A" }] }, "artists", "name");
     const asNumber = parseCandidates({ artists: [{ id: ID, score: 95, name: "SYNTH A" }] }, "artists", "name");
-    expect(asText).toEqual([{ mbid: ID, score: 95, name: "SYNTH A", credits: [] }]);
+    expect(asText).toEqual([{ mbid: ID, score: 95, name: "SYNTH A", aliases: [], credits: [] }]);
     expect(asNumber).toEqual(asText);
     const two = parseCandidates(
       { artists: [{ id: ID, score: "100", name: "A" }, { id: OTHER, score: "61", name: "B" }] },
@@ -79,6 +79,58 @@ describe("parseCandidates", () => {
     ]);
   });
 
+  it("reads the aliases an artist hit carries, as the search page shows them, and ignores an alias it cannot read", () => {
+    const body = {
+      artists: [
+        {
+          id: ID,
+          score: "100",
+          name: "SYNTH A",
+          "sort-name": "A, SYNTH",
+          aliases: [
+            { "sort-name": "SYNTH Alias One", name: "SYNTH Alias One", locale: "en", type: "Artist name", primary: true },
+            { name: "SYNTH Alias\u0000 Two" },
+            { "sort-name": "no name here" },
+            "odd",
+            { name: 5 },
+          ],
+        },
+        { id: OTHER, score: "50", name: "SYNTH B" },
+      ],
+    };
+    const [first, second] = parseCandidates(body, "artists", "name");
+    expect(first?.aliases).toEqual(["SYNTH Alias One", "SYNTH Alias Two"]);
+    expect(second?.aliases).toEqual([]);
+  });
+
+  it("keeps the credits in order, so the first one is the primary artist", () => {
+    const body = {
+      recordings: [
+        {
+          id: ID,
+          score: "100",
+          title: "SYNTH T",
+          "artist-credit": [{ artist: { id: OTHER, name: "SYNTH Main" } }, { artist: { id: ARTIST_ID, name: "SYNTH Guest" } }],
+        },
+      ],
+    };
+    expect(parseCandidates(body, "recordings", "title")[0]?.credits.map((credit) => credit.mbid)).toEqual([OTHER, ARTIST_ID]);
+  });
+
+  it("keeps no credits when the first credit cannot be read, so a later one is never taken for the primary", () => {
+    const body = {
+      recordings: [
+        {
+          id: ID,
+          score: "100",
+          title: "SYNTH T",
+          "artist-credit": [{ artist: { id: "x", name: "bad" } }, { artist: { id: ARTIST_ID, name: "SYNTH Guest" } }],
+        },
+      ],
+    };
+    expect(parseCandidates(body, "recordings", "title")[0]?.credits).toEqual([]);
+  });
+
   it("strips NUL characters from every name", () => {
     const body = {
       recordings: [
@@ -115,7 +167,7 @@ describe("parseCandidates", () => {
 });
 
 describe("readCandidates (a cached answer)", () => {
-  const good: Candidate = { mbid: ID, score: 100, name: "SYNTH A", credits: [{ mbid: ARTIST_ID, name: "SYNTH A" }] };
+  const good: Candidate = { mbid: ID, score: 100, name: "SYNTH A", aliases: ["SYNTH Alias"], credits: [{ mbid: ARTIST_ID, name: "SYNTH A" }] };
 
   it("reads what parseCandidates produced", () => {
     expect(readCandidates([good])).toEqual([good]);
@@ -130,6 +182,9 @@ describe("readCandidates (a cached answer)", () => {
     ["credits that are not a list", [{ ...good, credits: "x" }]],
     ["a credit with a bad ID", [{ ...good, credits: [{ mbid: "x", name: "n" }] }]],
     ["an old whole-body cache entry", { recordings: [] }],
+    ["a hit cached before aliases were kept", [{ mbid: ID, score: 100, name: "SYNTH A", credits: [] }]],
+    ["aliases that are not a list", [{ ...good, aliases: "x" }]],
+    ["an alias that is not text", [{ ...good, aliases: [5] }]],
   ])("throws on %s", (_name, value) => {
     expect(() => readCandidates(value)).toThrow(UserError);
   });
@@ -141,6 +196,7 @@ describe("decide", () => {
     mbid: ID,
     score,
     name: "SYNTH T",
+    aliases: [],
     credits: [{ mbid: ARTIST_ID, name: "synth artist a" }],
     ...overrides,
   });
@@ -164,7 +220,7 @@ describe("decide", () => {
     expect(decide([], track)).toEqual({ state: "unresolved", reason: "no_match", score: null, name: null });
   });
 
-  it("accepts a hit only when an artist credit, normalized like a source key, equals the play's artist", () => {
+  it("accepts a hit only when its primary artist credit, normalized like a source key, equals the play's artist", () => {
     expect(decide([hit(100)], track)).toMatchObject({ state: "resolved" });
     const wrong = hit(100, { credits: [{ mbid: OTHER, name: "SYNTH Someone Else" }] });
     expect(decide([wrong], track)).toMatchObject({ state: "unresolved", reason: "no_match", score: 100, name: "SYNTH T" });
@@ -172,10 +228,70 @@ describe("decide", () => {
     expect(decide([none], track)).toMatchObject({ state: "unresolved", reason: "no_match" });
   });
 
-  it("accepts a hit whose credit is the artist already matched, whatever name it carries", () => {
+  it("accepts a hit whose primary credit is the artist already matched, whatever name it carries", () => {
     const renamed = hit(100, { credits: [{ mbid: ARTIST_ID, name: "SYNTH Artist A (stylized)" }] });
     expect(decide([renamed], track)).toMatchObject({ state: "unresolved", reason: "no_match" });
     expect(decide([renamed], track, ARTIST_ID)).toMatchObject({ state: "resolved", mbid: ID });
+  });
+
+  it("does not accept a hit that credits the played artist only as a featured artist", () => {
+    const featured = hit(100, {
+      credits: [
+        { mbid: OTHER, name: "SYNTH Main Act" },
+        { mbid: ARTIST_ID, name: "SYNTH Artist A" },
+      ],
+    });
+    expect(decide([featured], track)).toEqual({ state: "unresolved", reason: "no_match", score: 100, name: "SYNTH T" });
+    expect(decide([featured], track, ARTIST_ID)).toMatchObject({ state: "unresolved", reason: "no_match" });
+  });
+
+  it("accepts a hit whose primary credit is the played artist, with a guest credited after", () => {
+    const withGuest = hit(97, {
+      credits: [
+        { mbid: ARTIST_ID, name: "SYNTH Artist A" },
+        { mbid: OTHER, name: "SYNTH Guest" },
+      ],
+    });
+    expect(decide([withGuest], track)).toMatchObject({ state: "resolved", score: 97 });
+  });
+
+  it("accepts the primary artist under the name it was credited as", () => {
+    const credited = hit(100, {
+      credits: [
+        { mbid: ARTIST_ID, name: "SYNTH Legal Name" },
+        { mbid: ARTIST_ID, name: "SYNTH  ARTIST A" },
+      ],
+    });
+    expect(decide([credited], track)).toMatchObject({ state: "resolved" });
+  });
+
+  it("accepts a hit only when its title equals the title played, after normalization", () => {
+    const cases = ["SYNTH T (Remix)", "SYNTH T - Live", "SYNTH T Pt. 2", "SYNTH"];
+    for (const title of cases) {
+      expect(decide([hit(95, { name: title })], track), title).toEqual({ state: "unresolved", reason: "no_match", score: 95, name: title });
+    }
+    expect(decide([hit(95, { name: "  synth   t " })], track)).toMatchObject({ state: "resolved" });
+    expect(decide([hit(95, { name: "SYNTH T" })], track)).toMatchObject({ state: "resolved" });
+  });
+
+  it("does not take a remix or a featuring credit that scores 90 or more, and keeps its score and name for audit", () => {
+    const remix = hit(96, { name: "SYNTH T (SYNTH Other Remix)", credits: [{ mbid: OTHER, name: "SYNTH Other" }] });
+    expect(decide([remix], track)).toEqual({ state: "unresolved", reason: "no_match", score: 96, name: "SYNTH T (SYNTH Other Remix)" });
+  });
+
+  it("treats an album the same way: the title and the primary credit must both match", () => {
+    const album: Context = { kind: "album", key: "k", name: "SYNTH B", artist: "SYNTH Artist A" };
+    const right = hit(100, { name: "SYNTH B" });
+    expect(decide([right], album)).toMatchObject({ state: "resolved" });
+    expect(decide([hit(100, { name: "SYNTH B (Deluxe)" })], album)).toMatchObject({ state: "unresolved", reason: "no_match" });
+    const featured = hit(100, { name: "SYNTH B", credits: [{ mbid: OTHER, name: "SYNTH Main" }, { mbid: ARTIST_ID, name: "SYNTH Artist A" }] });
+    expect(decide([featured], album)).toMatchObject({ state: "unresolved", reason: "no_match" });
+  });
+
+  it("matches a title and an artist across accents, curly quotes and &", () => {
+    const context: Context = { kind: "track", key: "k", name: "SYNTH Don\u2019t Stop & Go", artist: "SYNTH Beyonc\u00e9" };
+    const found = hit(100, { name: "SYNTH Don't Stop and Go", credits: [{ mbid: ARTIST_ID, name: "SYNTH Beyonce" }] });
+    expect(decide([found], context)).toMatchObject({ state: "resolved" });
   });
 
   it("skips a wrong-artist hit and takes the right one behind it", () => {
@@ -193,11 +309,43 @@ describe("decide", () => {
     expect(decide([hit(100), hit(100)], track)).toMatchObject({ state: "resolved" });
   });
 
-  it("does not check credits for an artist search, and an artist search can be ambiguous", () => {
+  it("can be ambiguous for an artist search, which has no credits to check", () => {
     const artist: Context = { kind: "artist", key: "fred", name: "Fred" };
-    const fred = (mbid: string, score: number): Candidate => ({ mbid, score, name: "Fred", credits: [] });
+    const fred = (mbid: string, score: number): Candidate => ({ mbid, score, name: "Fred", aliases: [], credits: [] });
     expect(decide([fred(ID, 100)], artist)).toMatchObject({ state: "resolved" });
     expect(decide([fred(ID, 100), fred(OTHER, 100)], artist)).toMatchObject({ state: "unresolved", reason: "ambiguous" });
+  });
+
+  describe("an artist hit", () => {
+    const artist: Context = { kind: "artist", key: "synth artist a", name: "SYNTH Artist A" };
+    const named = (name: string, score: number, aliases: string[] = [], mbid = ID): Candidate => ({ mbid, score, name, aliases, credits: [] });
+
+    it("must carry the played name: a different name is no_match, with its score and name kept for audit", () => {
+      expect(decide([named("SYNTH Artist A and the Band", 100)], artist)).toEqual({
+        state: "unresolved",
+        reason: "no_match",
+        score: 100,
+        name: "SYNTH Artist A and the Band",
+      });
+    });
+
+    it("accepts the name after normalization", () => {
+      expect(decide([named("  synth  ARTIST a ", 95)], artist)).toMatchObject({ state: "resolved", mbid: ID });
+    });
+
+    it("accepts a hit when one of the aliases it returned is the played name", () => {
+      expect(decide([named("SYNTH Real Name", 92, ["SYNTH Other", "synth artist a"])], artist)).toMatchObject({ state: "resolved", mbid: ID });
+    });
+
+    it("does not accept a hit by an alias it did not return", () => {
+      expect(decide([named("SYNTH Real Name", 100, ["SYNTH Other"])], artist)).toMatchObject({ state: "unresolved", reason: "no_match" });
+    });
+
+    it("skips a wrong-name hit and takes the right one behind it, and is below_threshold when the right one scores low", () => {
+      const wrong = named("SYNTH Someone Else", 100, [], OTHER);
+      expect(decide([wrong, named("SYNTH Artist A", 95)], artist)).toMatchObject({ state: "resolved", mbid: ID, score: 95 });
+      expect(decide([wrong, named("SYNTH Artist A", 70)], artist)).toMatchObject({ state: "unresolved", reason: "below_threshold", score: 70 });
+    });
   });
 
   it("carries the credits of the accepted hit, so an artist can be settled from them", () => {

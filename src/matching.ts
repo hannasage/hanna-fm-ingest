@@ -1,5 +1,5 @@
 import { UserError } from "./files.ts";
-import { artistKey, escapePhrase, stripNul } from "./names.ts";
+import { artistKey, escapePhrase, normalizeName, stripNul } from "./names.ts";
 import { MATCH_MIN_SCORE } from "./settings.ts";
 
 export type Kind = "artist" | "album" | "track";
@@ -23,7 +23,12 @@ export type Candidate = {
   /** MusicBrainz's own score, 0 to 100, exactly as sent. It is never rounded before it is compared. */
   score: number;
   name: string;
-  /** The artists credited on a recording or release group, under each name they carry. Empty for an artist hit. */
+  /** The aliases the hit came with, as text. Only an artist hit carries any. */
+  aliases: string[];
+  /**
+   * The artists credited on a recording or release group, in MusicBrainz's order, under each name they carry.
+   * The first one is the primary artist. Empty for an artist hit, and for a hit whose first credit could not be read.
+   */
   credits: { mbid: string; name: string }[];
 };
 
@@ -67,13 +72,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /** The most hits read from one answer. MusicBrainz is asked for fewer, so a longer list is read no further. */
 const MAX_HITS = 100;
 
+/** The most aliases kept for one hit, so a cached answer stays small. */
+const MAX_ALIASES = 100;
+
 /**
  * Reads every hit from a search answer. `list` is the answer's list name (recordings, release-groups,
  * artists) and `nameKey` is the key holding a hit's name (title or name). An empty list is no hit.
  * A malformed answer throws.
  *
- * An artist credit is `{ artist: { id, name } }`, as on the MusicBrainz search page. A credit may also carry
- * the name it was credited under, and then that name counts as well. NUL characters are stripped from every name.
+ * An artist credit is `{ artist: { id, name } }`, as on the MusicBrainz search page, and the first one is the
+ * primary artist. A credit may also carry the name it was credited under, and then that name counts as well.
+ * An artist hit's `aliases` is a list of `{ name, ... }`, as on that page. NUL characters are stripped from every name.
  */
 export function parseCandidates(body: unknown, list: string, nameKey: "title" | "name"): Candidate[] {
   if (!isRecord(body)) throw new UserError(WRONG_SHAPE);
@@ -89,19 +98,30 @@ export function parseCandidates(body: unknown, list: string, nameKey: "title" | 
     if (typeof name !== "string") throw new UserError(WRONG_SHAPE);
     if (typeof score !== "number" || !Number.isFinite(score) || score < 0 || score > 100) throw new UserError(WRONG_SHAPE);
 
+    const aliases: string[] = [];
+    if (Array.isArray(hit.aliases)) {
+      for (const alias of (hit.aliases as unknown[]).slice(0, MAX_ALIASES)) {
+        if (isRecord(alias) && typeof alias.name === "string") aliases.push(stripNul(alias.name));
+      }
+    }
+
     const credits: Candidate["credits"] = [];
     const credit = hit["artist-credit"];
     if (Array.isArray(credit)) {
-      for (const entry of credit as unknown[]) {
+      for (const [index, entry] of (credit as unknown[]).entries()) {
         const artist = isRecord(entry) ? entry.artist : undefined;
-        if (!isRecord(artist) || typeof artist.id !== "string" || !UUID.test(artist.id) || typeof artist.name !== "string") continue;
+        if (!isRecord(artist) || typeof artist.id !== "string" || !UUID.test(artist.id) || typeof artist.name !== "string") {
+          // A credit that cannot be read is skipped. When it is the first, nobody can say who the primary artist is.
+          if (index === 0) break;
+          continue;
+        }
         const mbid = artist.id.toLowerCase();
         credits.push({ mbid, name: stripNul(artist.name) });
         const credited = (entry as Record<string, unknown>).name;
         if (typeof credited === "string" && credited !== artist.name) credits.push({ mbid, name: stripNul(credited) });
       }
     }
-    return { mbid: id.toLowerCase(), score, name: stripNul(name), credits };
+    return { mbid: id.toLowerCase(), score, name: stripNul(name), aliases, credits };
   });
 }
 
@@ -110,24 +130,38 @@ export function readCandidates(value: unknown): Candidate[] {
   if (!Array.isArray(value)) throw new UserError(WRONG_CACHE);
   return value.map((hit: unknown): Candidate => {
     if (!isRecord(hit) || typeof hit.mbid !== "string" || !UUID.test(hit.mbid)) throw new UserError(WRONG_CACHE);
-    const { score, name, credits } = hit;
+    const { score, name, credits, aliases } = hit;
     if (typeof score !== "number" || !Number.isFinite(score) || score < 0 || score > 100) throw new UserError(WRONG_CACHE);
     if (typeof name !== "string" || !Array.isArray(credits)) throw new UserError(WRONG_CACHE);
+    // A row cached before aliases were kept has none, so it is read as the wrong shape and fetched again.
+    if (!Array.isArray(aliases) || !(aliases as unknown[]).every((alias) => typeof alias === "string")) throw new UserError(WRONG_CACHE);
     const read = (credits as unknown[]).map((credit) => {
       if (!isRecord(credit) || typeof credit.mbid !== "string" || !UUID.test(credit.mbid) || typeof credit.name !== "string") {
         throw new UserError(WRONG_CACHE);
       }
       return { mbid: credit.mbid, name: credit.name };
     });
-    return { mbid: hit.mbid, score, name, credits: read };
+    return { mbid: hit.mbid, score, name, aliases: aliases as string[], credits: read };
   });
+}
+
+/**
+ * The credits that belong to the primary (first) artist of a hit, under every name that artist carries.
+ * A guest or featured artist is not among them.
+ */
+export function primaryCredits(hit: Pick<Candidate, "credits">): Candidate["credits"] {
+  const first = hit.credits[0];
+  return first === undefined ? [] : hit.credits.filter((credit) => credit.mbid === first.mbid);
 }
 
 /**
  * Chooses among the hits of one search.
  *
- * - A track or album with a known artist takes a hit only when one of its artist credits, normalized as a
- *   source key is, names the artist played, or is the artist already matched (`knownArtistMbid`).
+ * A hit is taken into account only when it names what was played:
+ * - An artist hit: its name, or one of the aliases it came with, equals the artist played, both normalized as a source key is.
+ * - A track or album hit: its title equals the title played, normalized the same way. And when the play names an
+ *   artist, the hit's primary (first) artist credit, under any name it carries, names that artist, or is the artist
+ *   already matched (`knownArtistMbid`). A match only on a featured credit does not count.
  * - Of the hits left, those whose raw score is at least MATCH_MIN_SCORE count. When two different MusicBrainz
  *   IDs count, the match is `ambiguous` and nothing is settled. A search can find the same name twice.
  * - Otherwise the best hit left is `below_threshold`. When no hit is left, it is `no_match`, and the score and
@@ -136,10 +170,15 @@ export function readCandidates(value: unknown): Candidate[] {
 export function decide(candidates: Candidate[], context: Context, knownArtistMbid?: string): Decision {
   const best = (hits: Candidate[]): Candidate | undefined => hits.reduce<Candidate | undefined>((top, hit) => (top === undefined || hit.score > top.score ? hit : top), undefined);
 
+  const wantedName = normalizeName(context.name);
   const checksArtist = context.kind !== "artist" && Boolean(context.artist);
-  const wanted = artistKey(context.artist ?? "");
-  const fits = (hit: Candidate): boolean =>
-    !checksArtist || hit.credits.some((credit) => credit.mbid === knownArtistMbid || artistKey(credit.name) === wanted);
+  const wantedArtist = artistKey(context.artist ?? "");
+  const fits = (hit: Candidate): boolean => {
+    if (context.kind === "artist") return [hit.name, ...hit.aliases].some((each) => normalizeName(each) === wantedName);
+    if (normalizeName(hit.name) !== wantedName) return false;
+    if (!checksArtist) return true;
+    return primaryCredits(hit).some((credit) => credit.mbid === knownArtistMbid || artistKey(credit.name) === wantedArtist);
+  };
 
   const acceptable = candidates.filter(fits);
   const counting = acceptable.filter((hit) => hit.score >= MATCH_MIN_SCORE);

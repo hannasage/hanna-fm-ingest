@@ -108,11 +108,18 @@ export const answer = {
       "artist-credit": (hit.artists ?? []).map((artist) => ({ artist: { id: artist.id, name: artist.name, "sort-name": artist.name } })),
     })),
   }),
-  artist: (...hits: { id: string; score: number; name: string }[]) => ({
+  /** An artist hit may carry aliases, as the search page shows: `aliases: [{ name, "sort-name", ... }]`. */
+  artist: (...hits: { id: string; score: number; name: string; aliases?: string[] }[]) => ({
     created: "2026-01-01T00:00:00.000Z",
     count: hits.length,
     offset: 0,
-    artists: hits.map((hit) => ({ id: hit.id, score: String(hit.score), name: hit.name, "sort-name": hit.name })),
+    artists: hits.map((hit) => ({
+      id: hit.id,
+      score: String(hit.score),
+      name: hit.name,
+      "sort-name": hit.name,
+      ...(hit.aliases ? { aliases: hit.aliases.map((alias) => ({ name: alias, "sort-name": alias, locale: null, type: null, primary: null })) } : {}),
+    })),
   }),
   /** No match: MusicBrainz answers 200 with an empty list. */
   empty: (listName: "recordings" | "release-groups" | "artists") => ({ count: 0, offset: 0, [listName]: [] }),
