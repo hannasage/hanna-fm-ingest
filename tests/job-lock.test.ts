@@ -1,3 +1,4 @@
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { beforeEach, describe, expect, it } from "vitest";
 import { acquireLock, refreshLock, releaseLock } from "../src/job-lock.ts";
 import { RESOLVE_LOCK_LEASE_MS, RESOLVE_LOCK_NAME } from "../src/settings.ts";
@@ -57,6 +58,19 @@ describe("job lock", () => {
     await releaseLock(db, old!);
     expect(await lockedUntil()).not.toBeNull();
     expect(await refreshLock(db, next!, 60_000)).toBe(true);
+  });
+
+  it("does not throw when the database cannot be reached while freeing the lock, because the lease runs out anyway", async () => {
+    const lease = await acquireLock(db, NAME, 60_000);
+    const thrower = { from: () => { throw new TypeError("fetch failed"); } } as unknown as SupabaseClient;
+    const rejecter = {
+      from: () => ({ update: () => ({ eq: () => ({ in: () => Promise.reject(new TypeError("fetch failed")) }) }) }),
+    } as unknown as SupabaseClient;
+
+    await expect(releaseLock(thrower, lease!)).resolves.toBeUndefined();
+    await expect(releaseLock(rejecter, lease!)).resolves.toBeUndefined();
+    // Nothing was freed, so the lock is still held until the lease runs out.
+    expect(await lockedUntil()).not.toBeNull();
   });
 
   it("moves the lease forward when refreshed", async () => {

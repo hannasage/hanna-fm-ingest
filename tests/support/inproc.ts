@@ -25,7 +25,7 @@ export function networkError(code: string, message: string): Error {
 export function inProcess(
   db: SupabaseClient,
   respond: (call: Call, count: number) => FetchReply | Fail,
-  options: { intervalMs?: number } = {},
+  options: { intervalMs?: number; beforeAttempt?: () => Promise<void> } = {},
 ) {
   const clock = { now: 0 };
   const queue = new RateLimitedQueue(
@@ -61,6 +61,7 @@ export function inProcess(
     cache: new SupabaseCache(db),
     queue,
     fetch: fetchImpl,
+    ...(options.beforeAttempt ? { beforeAttempt: options.beforeAttempt } : {}),
   });
   return { musicbrainz, calls, clock, queue };
 }

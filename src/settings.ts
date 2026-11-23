@@ -31,10 +31,12 @@ export const MB_MAX_ATTEMPTS = 3;
 export const MB_BACKOFF_BASE_MS = 1000;
 
 /**
- * The longest Retry-After wait the command accepts: five minutes. A longer one is cut to this.
- * The wait applies to the whole queue, so the next lookup waits too. The run's lock lease is far longer.
+ * The longest Retry-After wait the command accepts: 120 seconds. A longer one is cut to this.
+ * The wait applies to the whole queue, so the next lookup waits too. The run refreshes its lock lease before every
+ * try, and the lease (RESOLVE_LOCK_LEASE_MS) is far longer than this wait and a request together, so one item
+ * can never outlive it.
  */
-export const MB_RETRY_AFTER_MAX_MS = 5 * 60 * 1000;
+export const MB_RETRY_AFTER_MAX_MS = 120 * 1000;
 
 /** How long one MusicBrainz request may take before it counts as no answer. */
 export const MB_REQUEST_TIMEOUT_MS = 30_000;

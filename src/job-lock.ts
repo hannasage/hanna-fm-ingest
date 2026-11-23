@@ -60,9 +60,14 @@ export async function refreshLock(client: SupabaseClient, lease: Lease, leaseMs:
 
 /**
  * Frees the lock, only if it still holds this run's lease, which includes a refresh still being written.
- * A failure here is not worth stopping for: the lease runs out.
+ * A failure here, an error answer or a thrown network error, is not worth stopping for: the lease runs out.
+ * It never throws, so the caller still prints its report and exits with the right code.
  */
 export async function releaseLock(client: SupabaseClient, lease: Lease): Promise<void> {
   const held = lease.next === undefined ? [lease.lockedUntil] : [lease.lockedUntil, lease.next];
-  await client.from("job_locks").update({ locked_until: null }).eq("name", lease.name).in("locked_until", held);
+  try {
+    await client.from("job_locks").update({ locked_until: null }).eq("name", lease.name).in("locked_until", held);
+  } catch {
+    // The database cannot be reached. The lease runs out by itself.
+  }
 }

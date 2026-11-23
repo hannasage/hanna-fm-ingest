@@ -150,6 +150,11 @@ export type MusicBrainzOptions = {
   cache: Cache;
   queue?: RateLimitedQueue;
   fetch?: typeof fetch;
+  /**
+   * Runs before every HTTP attempt, retries included, and before the wait that attempt may need.
+   * The command uses it to refresh its lock lease, and it throws when the lock is lost, which stops the lookup.
+   */
+  beforeAttempt?: () => Promise<void>;
 };
 
 /**
@@ -202,6 +207,8 @@ export class MusicBrainz {
 
     let kind = "network";
     for (let attempt = 1; attempt <= MB_MAX_ATTEMPTS; attempt += 1) {
+      // The lease is refreshed first, so the wait this attempt may have to sit through (a Retry-After) is inside it.
+      await this.options.beforeAttempt?.();
       const result = await this.queue.run(() => this.attempt(url));
 
       if (result.type === "response") {

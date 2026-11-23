@@ -45,7 +45,7 @@ describe("request", () => {
 
     expect(first).toMatchObject({ outcome: "ok", cached: false });
     expect(second).toMatchObject({ outcome: "ok", cached: true });
-    expect(first.outcome === "ok" && first.candidates).toEqual([{ mbid: id(1), score: 100, name: "SYNTH Artist", credits: [] }]);
+    expect(first.outcome === "ok" && first.candidates).toEqual([{ mbid: id(1), score: 100, name: "SYNTH Artist", aliases: [], credits: [] }]);
     expect(musicbrainz.cacheHits).toBe(1);
   });
 });
@@ -61,7 +61,7 @@ describe("cache", () => {
     expect(data).toHaveLength(1);
     const row = data![0] as { request_hash: string; candidates: unknown };
     expect(row.request_hash).toBe(createHash("sha256").update(calls[0]!.url).digest("hex"));
-    expect(row.candidates).toEqual([{ mbid: id(1), score: 100, name: "SYNTH Artist", credits: [] }]);
+    expect(row.candidates).toEqual([{ mbid: id(1), score: 100, name: "SYNTH Artist", aliases: [], credits: [] }]);
     expect(JSON.stringify(row)).not.toContain("created");
   });
 
@@ -104,7 +104,7 @@ describe("cache", () => {
     expect(calls).toHaveLength(2);
     expect(result).toMatchObject({ outcome: "ok", cached: false });
     const { data } = await db.from("mb_cache").select("candidates");
-    expect(data).toEqual([{ candidates: [{ mbid: id(1), score: 100, name: "SYNTH Artist", credits: [] }] }]);
+    expect(data).toEqual([{ candidates: [{ mbid: id(1), score: 100, name: "SYNTH Artist", aliases: [], credits: [] }] }]);
   });
 
   it("caches nothing for an answer that is not usable", async () => {
@@ -248,7 +248,8 @@ describe("Retry-After and the one global cool-down", () => {
     expect(calls[1]!.at - calls[0]!.at).toBeLessThanOrEqual(20_000);
   });
 
-  it("cuts a wait longer than MB_RETRY_AFTER_MAX_MS to that cap, and ignores a header it cannot read", async () => {
+  it("cuts a wait longer than MB_RETRY_AFTER_MAX_MS to that cap of 120 seconds, and ignores a header it cannot read", async () => {
+    expect(MB_RETRY_AFTER_MAX_MS).toBe(120_000);
     const { musicbrainz, calls } = inProcess(db, (_call, count) =>
       count === 1 ? { status: 503, headers: { "retry-after": "86400" } } : count === 2 ? { status: 503, headers: { "retry-after": "soon" } } : OK,
     );
@@ -257,5 +258,57 @@ describe("Retry-After and the one global cool-down", () => {
 
     expect(calls[1]!.at - calls[0]!.at).toBe(MB_RETRY_AFTER_MAX_MS);
     expect(calls[2]!.at - calls[1]!.at).toBe(2000);
+  });
+});
+
+describe("the lease, refreshed before every attempt", () => {
+  it("runs the hook before each try, retries included, and before nothing else", async () => {
+    const log: string[] = [];
+    const { musicbrainz } = inProcess(
+      db,
+      (_call, count) => {
+        log.push(`send ${count}`);
+        return count < 3 ? { status: 503 } : OK;
+      },
+      { beforeAttempt: async () => void log.push("refresh") },
+    );
+
+    await musicbrainz.search("artist", QUERY, parse);
+    // A repeat is answered from the cache: no request, so no refresh.
+    await musicbrainz.search("artist", QUERY, parse);
+
+    expect(log).toEqual(["refresh", "send 1", "refresh", "send 2", "refresh", "send 3"]);
+  });
+
+  it("stops the lookup when the hook says the lock is lost, and sends nothing more", async () => {
+    let refreshes = 0;
+    const { musicbrainz, calls } = inProcess(db, () => ({ status: 503 }), {
+      beforeAttempt: async () => {
+        refreshes += 1;
+        if (refreshes === 2) throw new UserError("lock lost");
+      },
+    });
+
+    await expect(musicbrainz.search("artist", QUERY, parse)).rejects.toThrow("lock lost");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("never lets one item outlive the lease: a Retry-After of ten minutes waits 120 seconds, and each try starts with a fresh lease", async () => {
+    const LEASE_MS = 200_000;
+    let expiresAt = 0;
+    const lapsed: number[] = [];
+    const harness = inProcess(
+      db,
+      (call) => {
+        if (call.at >= expiresAt) lapsed.push(call.at);
+        return { status: 503, headers: { "retry-after": "600" } };
+      },
+      { beforeAttempt: async () => void (expiresAt = harness.clock.now + LEASE_MS) },
+    );
+
+    await harness.musicbrainz.search("artist", QUERY, parse);
+
+    expect(harness.calls.map((call) => call.at)).toEqual([0, 120_000, 240_000]);
+    expect(lapsed).toEqual([]);
   });
 });
