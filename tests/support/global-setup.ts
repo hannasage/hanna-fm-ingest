@@ -31,4 +31,7 @@ export default function setup() {
   }
   process.env.TEST_SUPABASE_URL = url;
   process.env.TEST_SUPABASE_SECRET_KEY = key;
+  if (values.ANON_KEY) process.env.TEST_SUPABASE_ANON_KEY = values.ANON_KEY;
+  // The database address holds the local password. It stays in memory, like the keys.
+  if (values.DB_URL) process.env.TEST_SUPABASE_DB_URL = values.DB_URL;
 }
