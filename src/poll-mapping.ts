@@ -1,4 +1,5 @@
 import { parseTimestamp, storableText } from "./parse.ts";
+import { MAX_TEXT_CHARS } from "./settings.ts";
 import type { PlayRow } from "./store.ts";
 
 /**
@@ -19,7 +20,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /** Text the database can store, with something in it. */
 function filled(value: unknown): value is string {
-  return storableText(value) && value.trim() !== "";
+  return storableText(value) && value.trim() !== "" && value.length <= MAX_TEXT_CHARS;
 }
 
 /**
@@ -60,7 +61,7 @@ export function mapItem(raw: unknown): Mapped {
     !filled(track.name) ||
     !filled(artistName) ||
     playedAt === null ||
-    (albumName !== undefined && albumName !== null && !storableText(albumName))
+    (albumName !== undefined && albumName !== null && !(storableText(albumName) && albumName.length <= MAX_TEXT_CHARS))
   ) {
     return { skipped: "malformed" };
   }

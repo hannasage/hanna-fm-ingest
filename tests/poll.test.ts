@@ -43,8 +43,9 @@ const MSG = {
   shape: "Spotify sent a response in a shape the poller does not know.",
   network: "Could not reach Spotify. Check the network, then run the poll again.",
   status500: "Spotify answered with an unexpected status (HTTP 500).",
-  rotated:
-    "warning: Spotify sent a new refresh token. Update SPOTIFY_REFRESH_TOKEN with the new value, because the old one may stop working.",
+  rotated: "::warning::Spotify issued a new refresh token. Re-authorize and store the new token.",
+  tooMany: "Spotify sent more than 50 items in one page, which is more than the poller accepts.",
+  tooLarge: "Spotify sent a response larger than 1 MB, so the poller did not read it.",
 };
 
 const tokenOk = (extra: Record<string, unknown> = {}): Answer =>
@@ -426,6 +427,51 @@ describe("poll: failures are loud and plain", () => {
       await proxy.close();
     }
     expect(await stored()).toHaveLength(0);
+  });
+});
+
+describe("poll: limits on what Spotify sends", () => {
+  it("refuses a page with more than 50 items, and stores nothing", async () => {
+    const items = Array.from({ length: 51 }, (_, index) => item(index + 1, seconds("2026-11-20T10:00:00Z", index * 200)));
+    const { result } = await poll({ recent: () => page(items) });
+    expectFailure(result, MSG.tooMany);
+    expect(await stored()).toHaveLength(0);
+  });
+
+  it("refuses a response body over 1 MB, and never prints any of it", async () => {
+    const huge = "Z".repeat(1_048_577);
+    const { result } = await poll({ recent: () => ({ status: 200, body: `{"items":[],"pad":"${huge}"}` }) });
+    expectFailure(result, MSG.tooLarge);
+    expect(result.output).not.toContain("ZZZZZZZZ");
+  });
+
+  it("refuses an oversized body from the token endpoint too", async () => {
+    const huge = "Z".repeat(1_048_577);
+    const { result, fake } = await poll({ token: () => ({ status: 200, body: `{"pad":"${huge}"}` }) });
+    expectFailure(result, MSG.tooLarge);
+    expect(fake.recentRequests).toHaveLength(0);
+  });
+
+  it("reads a body just under 1 MB", async () => {
+    const pad = "Z".repeat(1_040_000);
+    const { result } = await poll({ recent: () => ({ status: 200, body: `{"items":[],"pad":"${pad}"}` }) });
+    expect(result.status).toBe(0);
+  });
+
+  it.each([
+    ["track name", { name: "N".repeat(501) }],
+    ["artist name", { artists: [{ name: "A".repeat(501) }] }],
+    ["album name", { album: { name: "B".repeat(501), artists: [{ name: "X" }] } }],
+  ])("counts a %s over 500 characters as malformed, and keeps the good play", async (_label, over) => {
+    const { result } = await poll({
+      recent: () => page([item(1, "2026-11-20T10:00:00Z", over), item(2, "2026-11-20T10:01:00Z")]),
+    });
+    expect(counts(result.stdout)).toMatchObject({ fetched: 2, stored: 1, malformed: 1 });
+  });
+
+  it("keeps a name of exactly 500 characters", async () => {
+    const { result } = await poll({ recent: () => page([item(1, "2026-11-20T10:00:00Z", { name: "N".repeat(500) })]) });
+    expect(counts(result.stdout)).toMatchObject({ fetched: 1, stored: 1, malformed: 0 });
   });
 });
 

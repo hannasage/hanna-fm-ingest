@@ -1,5 +1,5 @@
 import { UserError } from "./files.ts";
-import { POLL_LIMIT, SPOTIFY_TIMEOUT_MS } from "./settings.ts";
+import { MAX_RESPONSE_BYTES, POLL_LIMIT, SPOTIFY_TIMEOUT_MS } from "./settings.ts";
 
 /**
  * The two Spotify calls the poller makes, and what each failure says.
@@ -29,8 +29,9 @@ export const MESSAGES = {
   shape: "Spotify sent a response in a shape the poller does not know.",
   network: "Could not reach Spotify. Check the network, then run the poll again.",
   status: (status: number) => `Spotify answered with an unexpected status (HTTP ${status}).`,
-  rotated:
-    "warning: Spotify sent a new refresh token. Update SPOTIFY_REFRESH_TOKEN with the new value, because the old one may stop working.",
+  rotated: "::warning::Spotify issued a new refresh token. Re-authorize and store the new token.",
+  tooLarge: "Spotify sent a response larger than 1 MB, so the poller did not read it.",
+  tooMany: `Spotify sent more than ${POLL_LIMIT} items in one page, which is more than the poller accepts.`,
 } as const;
 
 export type SpotifyConfig = {
@@ -44,17 +45,48 @@ export type SpotifyConfig = {
 
 type Answer = { status: number; headers: Headers; text: string };
 
+/** Reads the body as text, and stops with tooLarge once it passes MAX_RESPONSE_BYTES. */
+async function readCapped(response: Response): Promise<string> {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+    await response.body?.cancel();
+    throw new UserError(MESSAGES.tooLarge);
+  }
+  if (response.body === null) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let text = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_RESPONSE_BYTES) {
+      await reader.cancel();
+      throw new UserError(MESSAGES.tooLarge);
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  return text + decoder.decode();
+}
+
 /** Sends one request. Any network failure, timeout or redirect becomes the one network message. */
 async function send(url: string, init: RequestInit): Promise<Answer> {
+  let response: Response;
   try {
-    const response = await fetch(url, {
+    response = await fetch(url, {
       ...init,
       // A redirect would carry the login to another host. Spotify's calls do not redirect.
       redirect: "error",
       signal: AbortSignal.timeout(SPOTIFY_TIMEOUT_MS),
     });
-    return { status: response.status, headers: response.headers, text: await response.text() };
   } catch {
+    throw new UserError(MESSAGES.network);
+  }
+  try {
+    return { status: response.status, headers: response.headers, text: await readCapped(response) };
+  } catch (error) {
+    if (error instanceof UserError) throw error;
     throw new UserError(MESSAGES.network);
   }
 }
@@ -145,5 +177,6 @@ export async function fetchRecentlyPlayed(
 
   const body = parseJson(answer.text);
   if (!isRecord(body) || !Array.isArray(body.items)) throw new UserError(MESSAGES.shape);
+  if (body.items.length > POLL_LIMIT) throw new UserError(MESSAGES.tooMany);
   return body.items;
 }

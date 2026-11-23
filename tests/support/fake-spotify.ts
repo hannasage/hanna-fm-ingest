@@ -11,7 +11,7 @@ export type Seen = {
 };
 
 export type Answer = { status: number; body: string; headers?: Record<string, string> };
-export type Handler = (request: Seen) => Answer;
+export type Handler = (request: Seen) => Answer | Promise<Answer>;
 
 export type FakeSpotify = {
   /** Give this as both SPOTIFY_ACCOUNTS_BASE and SPOTIFY_API_BASE. */
@@ -54,10 +54,10 @@ export async function startFakeSpotify(handlers: { token: Handler; recent: Handl
       let answer: Answer = { status: 404, body: "{}" };
       if (seen.method === "POST" && seen.path === "/api/token") {
         tokenRequests.push(seen);
-        answer = handlers.token(seen);
+        answer = await handlers.token(seen);
       } else if (seen.method === "GET" && seen.path === "/me/player/recently-played") {
         recentRequests.push(seen);
-        answer = handlers.recent(seen);
+        answer = await handlers.recent(seen);
       }
       response.writeHead(answer.status, { "content-type": "application/json", ...answer.headers });
       response.end(answer.body);
@@ -78,6 +78,28 @@ export async function startFakeSpotify(handlers: { token: Handler; recent: Handl
         server.closeAllConnections();
         server.close(() => resolve());
       }),
+  };
+}
+
+type PlayedItem = { played_at: string };
+
+/**
+ * A recently-played handler that behaves like Spotify's paging: newest first, at most `limit`
+ * items, `after` and `before` as exclusive Unix times in milliseconds. Spotify refuses both at once,
+ * so this answers 400 when it sees both.
+ */
+export function recentFrom(all: PlayedItem[]): Handler {
+  const byNewest = [...all].sort((a, b) => Date.parse(b.played_at) - Date.parse(a.played_at));
+  return (request) => {
+    const after = request.query.get("after");
+    const before = request.query.get("before");
+    if (after !== null && before !== null) return json({ error: { status: 400 } }, 400);
+    const limit = Number(request.query.get("limit") ?? "20");
+    const items = byNewest
+      .filter((item) => after === null || Date.parse(item.played_at) > Number(after))
+      .filter((item) => before === null || Date.parse(item.played_at) < Number(before))
+      .slice(0, limit);
+    return json({ href: "https://synthetic.invalid/page", limit, next: null, cursors: null, items });
   };
 }
 

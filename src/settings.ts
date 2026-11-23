@@ -25,3 +25,15 @@ export const SPOTIFY_TIMEOUT_MS = 30_000;
 /** Where Spotify's token and API calls go, unless a test points the poll elsewhere. */
 export const DEFAULT_SPOTIFY_ACCOUNTS_BASE = "https://accounts.spotify.com";
 export const DEFAULT_SPOTIFY_API_BASE = "https://api.spotify.com/v1";
+
+/** The most pages one poll reads. A page holds up to POLL_LIMIT plays. Reaching this is a failure, not a quiet stop. */
+export const POLL_MAX_PAGES = 20;
+
+/** The most bytes the poll reads from one Spotify response: 1 MB. A larger one is refused. */
+export const MAX_RESPONSE_BYTES = 1024 * 1024;
+
+/** The most characters a track, artist or album name may hold. A longer one makes the item malformed. */
+export const MAX_TEXT_CHARS = 500;
+
+/** A play stamped more than this many seconds ahead of the clock is malformed. */
+export const FUTURE_TOLERANCE_SECONDS = 60;
