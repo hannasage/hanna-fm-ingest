@@ -1,6 +1,6 @@
 # hanna-fm-ingest
 
-The private data side of hanna.fm: a Node command-line tool in TypeScript that stores plays in Supabase. The spec is GitHub issue 1 and the tickets that follow it. The site is in the hanna-fm repository, which owns the database schema.
+The data side of hanna.fm: a Node command-line tool in TypeScript that stores plays in Supabase. The spec is GitHub issue 1 and the tickets that follow it. The site is in the hanna-fm repository, which owns the database schema.
 
 ## The four gates
 
