@@ -12,19 +12,34 @@ export function emptyCounts(): Counts {
     read: 0,
     imported: 0,
     duplicate: 0,
-    dropped: { podcast: 0, private_session: 0, malformed: 0 },
+    dropped: Object.fromEntries(DROP_REASONS.map((reason) => [reason, 0])) as Record<DropReason, number>,
   };
 }
 
-/** Counts only. No row content ever goes in this text. */
-export function formatReport(counts: Counts): string {
-  const dropped = DROP_REASONS.reduce((sum, reason) => sum + counts.dropped[reason], 0);
+function totalDropped(counts: Counts): number {
+  return DROP_REASONS.reduce((sum, reason) => sum + counts.dropped[reason], 0);
+}
+
+/** Rows read that no other count holds. It is 0 after a full run, and more after a failure. */
+export function notAttempted(counts: Counts): number {
+  return counts.read - counts.imported - counts.duplicate - totalDropped(counts);
+}
+
+/**
+ * Counts only. No row content ever goes in this text.
+ * `read` always equals imported + duplicate + dropped + not_attempted.
+ * A partial report, from a run that failed, ends with `partial: true`.
+ */
+export function formatReport(counts: Counts, options: { partial?: boolean } = {}): string {
+  const dropped = totalDropped(counts);
   return [
     `read: ${counts.read}`,
     `imported: ${counts.imported}`,
     `duplicate: ${counts.duplicate}`,
     `dropped: ${dropped}`,
     ...DROP_REASONS.map((reason) => `  ${reason}: ${counts.dropped[reason]}`),
+    `not_attempted: ${notAttempted(counts)}`,
+    ...(options.partial ? ["partial: true"] : []),
     "",
   ].join("\n");
 }

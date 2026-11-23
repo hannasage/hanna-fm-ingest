@@ -2,34 +2,35 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { UserError } from "./files.ts";
 import type { Play } from "./parse.ts";
 
-const BATCH_SIZE = 500;
+/** The pattern the site repository uses for any value it prints from a failure. */
+const SAFE_TOKEN = /^[A-Za-z0-9_]{1,40}$/;
+
+/** A database error code is printed only when it is a plain token. */
+function printableCode(code: unknown): string {
+  if (typeof code !== "string" || code === "") return "none";
+  return SAFE_TOKEN.test(code) ? code : "unknown";
+}
 
 /**
- * Stores plays and returns how many were new.
- * A play already stored (same track_uri and ended_at) is skipped, never changed.
- * Each batch is one request, so a failed run can simply be run again.
+ * Stores one batch of plays in one request and returns how many were new.
+ * A play already stored (same track_uri and ended_at) is skipped, never changed,
+ * so a failed run can simply be run again.
  */
-export async function storePlays(
-  client: SupabaseClient,
-  plays: Play[],
-  onBatch?: (inserted: number) => void,
-): Promise<number> {
-  let inserted = 0;
-  for (let start = 0; start < plays.length; start += BATCH_SIZE) {
-    const batch = plays.slice(start, start + BATCH_SIZE);
-    const { data, error } = await client
-      .from("plays")
-      .upsert(batch, { onConflict: "track_uri,ended_at", ignoreDuplicates: true })
-      .select("id");
-    if (error) {
-      // The error text can quote a row or the address. Report the code only.
-      throw new UserError(
-        `The database refused a batch (code ${error.code || "none"}). Check SUPABASE_URL and SUPABASE_SECRET_KEY, then run the command again: plays already stored are skipped.`,
-      );
-    }
-    const count = data?.length ?? 0;
-    inserted += count;
-    onBatch?.(count);
+export async function storeBatch(client: SupabaseClient, batch: Play[]): Promise<number> {
+  const { data, error } = await client
+    .from("plays")
+    .upsert(batch, { onConflict: "track_uri,ended_at", ignoreDuplicates: true })
+    .select("id");
+  if (error) {
+    // The error text can quote a row or the address. Report a plain code only.
+    throw new UserError(
+      `The database refused a batch (code ${printableCode(error.code)}). Check SUPABASE_URL and SUPABASE_SECRET_KEY, then run the command again: plays already stored are skipped.`,
+    );
   }
-  return inserted;
+  if (data === null) {
+    throw new UserError(
+      "The database gave no answer for a batch, so nothing can be counted. Run the command again: plays already stored are skipped.",
+    );
+  }
+  return data.length;
 }

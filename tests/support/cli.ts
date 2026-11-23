@@ -58,8 +58,11 @@ export function runImport(
 }
 
 /** Same as runImport, without blocking, so two imports can run at once. */
-export function runImportAsync(path: string): Promise<CliResult> {
-  const { command, args, env } = prepare(path, {});
+export function runImportAsync(
+  path: string,
+  extraEnv: Record<string, string | undefined> = {},
+): Promise<CliResult> {
+  const { command, args, env } = prepare(path, extraEnv);
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd: root, env, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";

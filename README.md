@@ -22,7 +22,23 @@ npm run import-export -- <path>
 
 `<path>` is one Extended Streaming History `.json` file, or a directory of them. Zip files are not read: unzip first.
 
-The command prints counts only: read, imported, duplicate, and dropped by reason (`podcast`, `private_session`, `malformed`). It never prints a row. A play already stored is skipped, so running the same import twice stores nothing new.
+The command prints counts only to stdout: `read`, `imported`, `duplicate`, `dropped` by reason, and `not_attempted`. It never prints a row. `read` always equals `imported` + `duplicate` + `dropped` + `not_attempted`. A play already stored is skipped, so running the same import twice stores nothing new.
+
+Dropped reasons, checked in this order:
+
+- `private_session`: the private flag is anything but an explicit `false`. A missing or odd value counts as private.
+- `podcast`: episode fields are present.
+- `no_track`: no usable track URI. It must be a string starting with `spotify:track:`.
+- `malformed`: a field is missing or has the wrong type.
+- `too_short`: played under `MIN_PLAY_MS` (30 seconds), set in `src/settings.ts`.
+
+Other behavior:
+
+- Every file is checked first, so a bad file fails the run before anything is written. Then files are read one at a time and stored in batches of 500. A path that is not a regular file, or a file over 500 MB, is refused before it is read.
+- If a database request fails midway, the command exits 1 and prints a message plus the partial counts, ending with `partial: true`, to stderr. Run it again: stored plays are skipped.
+- If a file holds no row with a mapped key, a one-line warning on stderr names the key. It never shows row content.
+- If rows were read but nothing was stored and no play was a repeat, the command exits 1 and says the mapping keys are probably wrong.
+- `SUPABASE_URL` must be https, unless the host is `localhost` or `127.0.0.1`. Otherwise the command exits 2 before it sends the key.
 
 The key names the importer reads are in one table, `src/mapping.ts`. Ticket 7 checks them against a real export.
 
@@ -44,3 +60,13 @@ The migrations in `supabase/migrations` are a vendored copy. The hanna-fm site r
 ```
 HANNA_FM_PATH=../hanna-fm npm run schema:sync
 ```
+
+`schema:sync` also writes `supabase/vendored-migrations.manifest.json`, a checksum for each vendored file. A test fails if a vendored file changes without a sync.
+
+To compare the copy with the site, run:
+
+```
+HANNA_FM_PATH=../hanna-fm npm run schema:check
+```
+
+It checks the manifest, and the site clone when `HANNA_FM_PATH` is set. CI cannot do the site comparison: the site repository is private, and CI cannot read it. CI runs the manifest check through the tests only. A CI diff against the site becomes possible once the site repository is public.

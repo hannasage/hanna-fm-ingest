@@ -1,4 +1,5 @@
 import { COLUMN_KEYS, SIGNAL_KEYS } from "./mapping.ts";
+import { MIN_PLAY_MS } from "./settings.ts";
 
 /** One play, as stored in the plays table. */
 export type Play = {
@@ -11,12 +12,20 @@ export type Play = {
   source: "export";
 };
 
-export const DROP_REASONS = ["podcast", "private_session", "malformed"] as const;
+export const DROP_REASONS = [
+  "podcast",
+  "private_session",
+  "no_track",
+  "too_short",
+  "malformed",
+] as const;
 export type DropReason = (typeof DROP_REASONS)[number];
 
 export type Classified = { play: Play } | { dropped: DropReason };
 
 const MAX_MS_PLAYED = 2_147_483_647; // the largest value of the integer column
+
+const TRACK_URI_PREFIX = "spotify:track:";
 
 const ISO_TIMESTAMP =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
@@ -63,7 +72,9 @@ function parseTimestamp(value: unknown): string | null {
 
 /**
  * Decides what one row of an export becomes: a play to store, or a drop with one reason.
- * A row that is both private and a podcast counts as private.
+ * The reasons are checked in this order, and the first that fits wins: private_session,
+ * podcast (episode fields are present), no_track (no usable track URI), malformed,
+ * too_short (a valid play under MIN_PLAY_MS).
  */
 export function classifyRow(raw: unknown): Classified {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
@@ -71,19 +82,22 @@ export function classifyRow(raw: unknown): Classified {
   }
   const row = raw as Record<string, unknown>;
 
-  // Fail safe: anything but a plain false or an absent flag is treated as private.
-  const flag = row[SIGNAL_KEYS.private_session];
-  if (flag !== undefined && flag !== null && flag !== false) {
+  // Fail safe: only an explicit false means "not private". A missing, null or odd value drops the row.
+  if (row[SIGNAL_KEYS.private_session] !== false) {
     return { dropped: "private_session" };
+  }
+
+  if (!isBlank(row[SIGNAL_KEYS.episode_name]) || !isBlank(row[SIGNAL_KEYS.episode_uri])) {
+    return { dropped: "podcast" };
   }
 
   const trackUri = row[COLUMN_KEYS.track_uri];
   if (
-    !isBlank(row[SIGNAL_KEYS.episode_name]) ||
-    !isBlank(row[SIGNAL_KEYS.episode_uri]) ||
-    isBlank(trackUri)
+    typeof trackUri !== "string" ||
+    !trackUri.startsWith(TRACK_URI_PREFIX) ||
+    trackUri.length === TRACK_URI_PREFIX.length
   ) {
-    return { dropped: "podcast" };
+    return { dropped: "no_track" };
   }
 
   const trackName = row[COLUMN_KEYS.track_name];
@@ -108,6 +122,8 @@ export function classifyRow(raw: unknown): Classified {
   ) {
     return { dropped: "malformed" };
   }
+
+  if (msPlayed < MIN_PLAY_MS) return { dropped: "too_short" };
 
   return {
     play: {
