@@ -12,12 +12,16 @@ import { checkState, setState, STATE_MESSAGES } from "./set-state.ts";
 import { formatResolveReport, resolveItems, emptyResolveCounts } from "./resolve-items.ts";
 import {
   DEFAULT_MB_API_BASE,
+  LOGIN_SCOPES,
+  LOGIN_TIMEOUT_MS,
+  RECORD_TIMEOUT_MS,
   DEFAULT_SPOTIFY_ACCOUNTS_BASE,
   DEFAULT_SPOTIFY_API_BASE,
   RESOLVE_LOCK_LEASE_MS,
   RESOLVE_LOCK_NAME,
   RESOLVE_MAX_ATTEMPTS,
 } from "./settings.ts";
+import { loginRedirectUri, runLogin } from "./spotify-login.ts";
 import type { SpotifyConfig } from "./spotify.ts";
 import { SupabaseCache } from "./item-store.ts";
 
@@ -31,7 +35,13 @@ const RESOLVE_USAGE = [
   "  Exit codes: 0 done, 1 stopped, or items stayed pending, or items are stuck (exhausted), 2 bad setting or argument, 3 another run holds the lock.",
 ].join("\n");
 const POLL_USAGE = "Usage: poll\n  Reads recent plays from Spotify and stores the new ones. It takes no arguments.";
-const USAGE = `${IMPORT_USAGE}\n${RESOLVE_USAGE}\n${POLL_USAGE}\n${STATE_MESSAGES.usage}`;
+const LOGIN_USAGE = [
+  "Usage: spotify-login",
+  "  Gets a Spotify refresh token. Reads SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET from the environment, never from arguments.",
+  "  It takes no arguments. SPOTIFY_LOGIN_PORT is optional: the redirect address registered in the Spotify app must name the same port.",
+  "  SUPABASE_URL and SUPABASE_SECRET_KEY are optional: with both set, it records spotify_authorized_at.",
+].join("\n");
+const USAGE = `${IMPORT_USAGE}\n${RESOLVE_USAGE}\n${POLL_USAGE}\n${STATE_MESSAGES.usage}\n${LOGIN_USAGE}`;
 
 function fail(message: string, code: number): never {
   process.stderr.write(`${message}\n`);
@@ -95,16 +105,19 @@ function required(name: string): string {
   return value;
 }
 
+/** A Spotify address from the environment, or the default. Exits 2 unless it is Spotify's own host over https, or this computer. */
+function spotifyBase(name: string, fallback: string, host: string): string {
+  const address = process.env[name] || fallback;
+  const problem = spotifyAddressProblem(name, address, host);
+  if (problem !== null) fail(problem, 2);
+  return address.replace(/\/+$/, "");
+}
+
 function spotifyConfig(): SpotifyConfig {
   const clientId = required("SPOTIFY_CLIENT_ID");
   const clientSecret = required("SPOTIFY_CLIENT_SECRET");
   const refreshToken = required("SPOTIFY_REFRESH_TOKEN");
-  const base = (name: string, fallback: string, host: string) => {
-    const address = process.env[name] || fallback;
-    const problem = spotifyAddressProblem(name, address, host);
-    if (problem !== null) fail(problem, 2);
-    return address.replace(/\/+$/, "");
-  };
+  const base = spotifyBase;
   return {
     clientId,
     clientSecret,
@@ -166,6 +179,51 @@ async function runSetState(args: string[]): Promise<void> {
     fail(describeStop(error, "command"), 1);
   }
   process.stdout.write(`Recorded ${state.key}.\n`);
+}
+
+/**
+ * The way `spotify-login` records the login date: the same check and the same write as `set-state`.
+ * Null when the two database variables are not both set. A bad address does not stop the login, which has
+ * already printed the token by then: the record fails, and the person is told how to record it by hand.
+ */
+function loginRecorder(): ((date: string) => Promise<void>) | null {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SECRET_KEY;
+  if (!url || !key) return null;
+  return async (date) => {
+    // The key is sent over https, or to this computer. Checked here, with no exit, so the login still ends cleanly.
+    const problem = addressProblem("SUPABASE_URL", url);
+    if (problem) throw new UserError(problem);
+    const client = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+    const state = checkState("spotify_authorized_at", date);
+    await setState(client, state.key, state.value, AbortSignal.timeout(RECORD_TIMEOUT_MS));
+  };
+}
+
+/** Gets a refresh token by the authorization code flow. The helper itself, `runLogin`, is in src/spotify-login.ts. */
+async function runSpotifyLogin(args: string[]): Promise<void> {
+  if (args.length > 0) fail(LOGIN_USAGE, 2);
+  const clientId = required("SPOTIFY_CLIENT_ID");
+  const clientSecret = required("SPOTIFY_CLIENT_SECRET");
+  const accountsBase = spotifyBase("SPOTIFY_ACCOUNTS_BASE", DEFAULT_SPOTIFY_ACCOUNTS_BASE, "accounts.spotify.com");
+  let redirectUri: string;
+  try {
+    redirectUri = loginRedirectUri(process.env.SPOTIFY_LOGIN_PORT);
+  } catch (error) {
+    fail(describeStop(error, "command"), 2);
+  }
+  process.exitCode = await runLogin({
+    clientId,
+    clientSecret,
+    accountsBase,
+    redirectUri,
+    scopes: LOGIN_SCOPES,
+    isTty: process.stdout.isTTY === true,
+    out: (text) => process.stdout.write(text),
+    err: (text) => process.stderr.write(text),
+    timeoutMs: LOGIN_TIMEOUT_MS,
+    recordAuthorized: loginRecorder(),
+  });
 }
 
 /** MusicBrainz asks every client for a User-Agent that says who it is. A header cannot hold a line break or a non-ASCII character. */
@@ -290,6 +348,7 @@ async function main(argv: string[]): Promise<void> {
     await runPoll();
   }
   else if (command === "set-state") await runSetState(rest);
+  else if (command === "spotify-login") await runSpotifyLogin(rest);
   else fail(USAGE, 2);
 }
 

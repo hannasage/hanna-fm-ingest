@@ -129,3 +129,48 @@ export const RECORD_TIMEOUT_MS = 10_000;
 
 /** The keys `set-state` may write to the poller_state table. Add a key here to allow it. */
 export const ALLOWED_STATE_KEYS = ["spotify_authorized_at"] as const;
+
+/**
+ * The address Spotify sends the browser back to after the login. The app owner registered exactly this address
+ * in the Spotify app, and Spotify requires the one sent in the request to match it exactly: same scheme, host,
+ * port, path, and no trailing slash. A loopback address must be the IP literal, because Spotify refuses `localhost`.
+ * `SPOTIFY_LOGIN_PORT` may change the port, and then the address registered in the app must be changed to match.
+ */
+export const SPOTIFY_REDIRECT_URI = "http://127.0.0.1:8765/callback";
+
+/** The lowest port `SPOTIFY_LOGIN_PORT` may name. Lower ports are reserved for the system. */
+export const LOGIN_PORT_MIN = 1024;
+
+/** How long `spotify-login` waits for the browser to come back: 5 minutes. */
+export const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** Random bytes in the `state` value that ties the callback to this run. 32 bytes is 256 bits. OAuth asks for unguessable. */
+export const LOGIN_STATE_BYTES = 32;
+
+/**
+ * Random bytes behind the PKCE code verifier. 96 bytes written in base64url is exactly 128 characters, the most
+ * Spotify's PKCE page allows (43 to 128, "the longer the better"), with no padding and no bias from a modulo.
+ */
+export const LOGIN_VERIFIER_BYTES = 96;
+
+/**
+ * The scopes `spotify-login` requests. Each name is on Spotify's Scopes page. The refresh token carries exactly
+ * these, so a scope added here means logging in again. Request the least that works: only the poller's scope now.
+ */
+export const LOGIN_SCOPES = [
+  // The poller: GET /me/player/recently-played.
+  "user-read-recently-played",
+] as const;
+
+/**
+ * Scopes that a later feature adds. NOT requested today, and the login never reads this list. It is here so the
+ * names are checked against Spotify's Scopes page now and are ready when the feature is built.
+ * To add one: move its name into LOGIN_SCOPES in the same change as the feature, then run `spotify-login` again
+ * (that also restarts the six month clock) and store the new token as the SPOTIFY_REFRESH_TOKEN secret.
+ */
+export const LATER_LOGIN_SCOPES = [
+  // A later Now playing strip: GET /me/player/currently-playing.
+  "user-read-currently-playing",
+  // A later playlist picker: the list of the person's private playlists.
+  "playlist-read-private",
+] as const;

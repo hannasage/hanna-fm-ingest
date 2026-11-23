@@ -51,10 +51,11 @@ export function checkState(key: string, value: string, nowMs: number = Date.now(
 }
 
 /** Stores one state row, or replaces the value of the row that holds the key. Run twice with one value, it leaves one row. */
-export async function setState(client: SupabaseClient, key: string, value: string): Promise<void> {
-  const { error } = await client
+export async function setState(client: SupabaseClient, key: string, value: string, signal?: AbortSignal): Promise<void> {
+  const query = client
     .from("poller_state")
     .upsert({ key, value, updated_at: new Date().toISOString() }, { onConflict: "key" });
+  const { error } = await (signal ? query.abortSignal(signal) : query);
   // The error text can quote the row or the address. Report a plain code only.
   if (error) throw new UserError(STATE_MESSAGES.refused(printableCode(error.code)));
 }
