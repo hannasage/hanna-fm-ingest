@@ -72,17 +72,33 @@ describe("fixtures", () => {
     expect(fixtures.length).toBeGreaterThan(0);
     for (const file of fixtures) expect(file).toMatch(/\.fixture\.json$/);
   });
+});
 
-  it("holds only synthetic values: documentation IP addresses and SYNTH track IDs", () => {
-    for (const file of fixtures) {
-      const text = readFileSync(file, "utf8");
+describe("tracked JSON files", () => {
+  // Tracked and not-yet-committed files, minus anything ignored.
+  const files = execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "*.json"], {
+    encoding: "utf8",
+  })
+    .split("\n")
+    .filter((f) => f !== "");
+
+  it("has files to check", () => {
+    expect(files.length).toBeGreaterThan(0);
+  });
+
+  it("hold only the synthetic markers: 203.0.113.x IPs, SYNTH ids, country ZZ", () => {
+    for (const file of files) {
+      const text = readFileSync(join(process.cwd(), file), "utf8");
       for (const ip of text.match(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g) ?? []) {
-        expect(ip, `${file} holds a non-documentation IP address`).toMatch(/^203\.0\.113\./);
+        expect(ip, `${file} holds a non-documentation IP address`).toMatch(/^203\.0\.113\.\d{1,3}$/);
       }
       for (const uri of text.match(/spotify:(?:track|episode):[A-Za-z0-9]+/g) ?? []) {
         expect(uri, `${file} holds a track or episode ID that is not synthetic`).toMatch(
           /^spotify:(?:track|episode):SYNTH/,
         );
+      }
+      for (const match of text.matchAll(/"conn_country"\s*:\s*"([^"]*)"/g)) {
+        expect(match[1], `${file} holds a country that is not ZZ`).toBe("ZZ");
       }
     }
   });
