@@ -59,6 +59,8 @@ export const POLL_MESSAGES = {
   capped: `Spotify has more plays than one poll reads (${POLL_MAX_PAGES} pages of ${POLL_LIMIT}). The plays fetched were stored. Plays older than those may be missing.`,
   stalled:
     "The poller could not page back to older plays, so it stopped. The plays fetched were stored. Plays older than those may be missing.",
+  onlyNoTrack: (fetched: number) =>
+    `Spotify sent ${fetched} item${fetched === 1 ? "" : "s"} and every one was a local file or an episode, which has no track to store. Nothing was stored. This is normal until a real play appears.`,
   allSkipped: (fetched: number) =>
     `Spotify sent ${fetched} item${fetched === 1 ? "" : "s"} and every one was skipped, so nothing was stored. The counts above show why. Check src/poll-mapping.ts against Spotify's answer.`,
   someMalformed: (malformed: number) =>
@@ -66,17 +68,33 @@ export const POLL_MESSAGES = {
 } as const;
 
 /**
+ * Why a poll that kept no play at all (nothing stored, nothing a repeat) came out so, from its skip counts.
+ * Local files and episodes (`no_track`) are normal, so a window of only those is no failure: the poll
+ * exits 0 and says so (`pollNotes`). It is a failure when at least one skipped item is `malformed`,
+ * which means a field was renamed or is odd.
+ */
+function keptNothing(counts: PollCounts): boolean {
+  return counts.fetched > 0 && counts.stored + counts.duplicateExport + counts.duplicateExact === 0;
+}
+
+/**
  * The reasons a finished poll must still exit 1, as plain lines. A run that stored nothing
- * by mistake, or that skipped a malformed item, or that stopped short of older plays, is never green.
+ * by mistake (a malformed item among the skips), or that skipped a malformed item, or that stopped
+ * short of older plays, is never green. A window of only local files and episodes is not a mistake.
  */
 export function pollProblems(counts: PollCounts): string[] {
   const problems: string[] = [];
   if (counts.gap === "capped") problems.push(POLL_MESSAGES.capped);
   if (counts.gap === "stalled") problems.push(POLL_MESSAGES.stalled);
-  const kept = counts.stored + counts.duplicateExport + counts.duplicateExact;
-  if (counts.fetched > 0 && kept === 0) problems.push(POLL_MESSAGES.allSkipped(counts.fetched));
-  else if (counts.skipped.malformed > 0) problems.push(POLL_MESSAGES.someMalformed(counts.skipped.malformed));
+  if (counts.skipped.malformed > 0) {
+    problems.push(keptNothing(counts) ? POLL_MESSAGES.allSkipped(counts.fetched) : POLL_MESSAGES.someMalformed(counts.skipped.malformed));
+  }
   return problems;
+}
+
+/** Plain lines for a poll that is green but kept nothing because every item was a local file or an episode. */
+export function pollNotes(counts: PollCounts): string[] {
+  return keptNothing(counts) && counts.skipped.malformed === 0 ? [POLL_MESSAGES.onlyNoTrack(counts.fetched)] : [];
 }
 
 /** The most rows one read of the plays table returns. A read that hits it may be cut short. */

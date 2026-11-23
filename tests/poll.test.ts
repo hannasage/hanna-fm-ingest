@@ -49,6 +49,8 @@ const MSG = {
     `${n} item${n === 1 ? "" : "s"} from Spotify could not be read (a field is missing or odd). The readable plays were stored. Check src/poll-mapping.ts against Spotify's answer.`,
   allSkipped: (n: number) =>
     `Spotify sent ${n} item${n === 1 ? "" : "s"} and every one was skipped, so nothing was stored. The counts above show why. Check src/poll-mapping.ts against Spotify's answer.`,
+  onlyNoTrack: (n: number) =>
+    `Spotify sent ${n} item${n === 1 ? "" : "s"} and every one was a local file or an episode, which has no track to store. Nothing was stored. This is normal until a real play appears.`,
   futureCursor:
     "The newest stored play is more than 60 seconds in the future, so the poll cannot use it as its starting point. Fix or delete that row, then run the poll again.",
   stalled:
@@ -492,12 +494,45 @@ describe("poll: failing loudly", () => {
     expectNoSecrets(result);
   });
 
-  it("exits 1 when every item is a local file or an episode", async () => {
+  it("exits 0 with a plain note when every item is a local file or an episode", async () => {
     const items = [item(1, "2026-11-20T10:00:00Z", { is_local: true }), item(2, "2026-11-20T10:01:00Z", { type: "episode" })];
     const { result } = await poll({ recent: () => page(items) });
+    expect(result.status).toBe(0);
+    expect(counts(result.stdout)).toMatchObject({ fetched: 2, stored: 0, duplicate: 0, skipped: 2, no_track: 2, malformed: 0 });
+    // A plain line, not an error annotation: the run stays green.
+    expect(result.stderr).toBe(`${MSG.onlyNoTrack(2)}\n`);
+    expect(result.stderr).not.toContain("::error::");
+    expect(await stored()).toHaveLength(0);
+  });
+
+  it("exits 0 for a window that holds only local files, run after run, until a real play appears", async () => {
+    const local = (n: number, minute: number) =>
+      item(n, `2026-11-20T10:0${minute}:00Z`, { is_local: true, uri: `spotify:local:Synthetic+Artist::Synthetic+Song+${n}::200` });
+    const window = [local(1, 0), local(2, 1), local(3, 2)];
+
+    const first = await poll({ recent: () => page(window) });
+    const second = await poll({ recent: () => page(window) });
+
+    for (const { result } of [first, second]) {
+      expect(result.status).toBe(0);
+      expect(counts(result.stdout)).toMatchObject({ fetched: 3, stored: 0, duplicate: 0, skipped: 3, no_track: 3, malformed: 0 });
+      expect(result.stderr).toBe(`${MSG.onlyNoTrack(3)}\n`);
+    }
+    expect(await stored()).toHaveLength(0);
+
+    const real = await poll({ recent: () => page([...window, item(9, "2026-11-20T10:09:00Z")]) });
+    expect(real.result.status).toBe(0);
+    expect(counts(real.result.stdout)).toMatchObject({ fetched: 4, stored: 1, no_track: 3 });
+    expect(real.result.stderr).toBe("");
+  });
+
+  it("still exits 1 when nothing was stored and even one skipped item is malformed, among local files", async () => {
+    const items = [item(1, "2026-11-20T10:00:00Z", { is_local: true }), item(2, "not a date"), item(3, "2026-11-20T10:02:00Z", { type: "episode" })];
+    const { result } = await poll({ recent: () => page(items) });
+
     expect(result.status).toBe(1);
-    expect(counts(result.stdout)).toMatchObject({ fetched: 2, stored: 0, no_track: 2 });
-    expect(result.stderr).toBe(`::error::${MSG.allSkipped(2)}\n`);
+    expect(counts(result.stdout)).toMatchObject({ fetched: 3, stored: 0, skipped: 3, no_track: 2, malformed: 1 });
+    expect(result.stderr).toBe(`::error::${MSG.allSkipped(3)}\n`);
   });
 
   it("exits 0 when some items are skipped as no_track and others are stored", async () => {

@@ -2,7 +2,7 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { addressProblem, spotifyAddressProblem } from "./address.ts";
 import { UserError } from "./files.ts";
 import { importExport } from "./import-export.ts";
-import { emptyPollCounts, poll, pollProblems } from "./poll.ts";
+import { emptyPollCounts, poll, pollNotes, pollProblems } from "./poll.ts";
 import { emptyCounts, formatPollReport, formatReport } from "./report.ts";
 import { DEFAULT_SPOTIFY_ACCOUNTS_BASE, DEFAULT_SPOTIFY_API_BASE } from "./settings.ts";
 import type { SpotifyConfig } from "./spotify.ts";
@@ -110,10 +110,12 @@ async function runPoll(): Promise<void> {
     process.exit(1);
   }
   process.stdout.write(formatPollReport(counts));
-  // A run that stored nothing by mistake, skipped a malformed item, or stopped short is never green.
+  // A run that skipped a malformed item (and so maybe stored nothing by mistake), or stopped short, is never green.
   // Each line is a GitHub annotation, so the run page shows it.
   const problems = pollProblems(counts);
   for (const problem of problems) process.stderr.write(`::error::${problem}\n`);
+  // A window of only local files and episodes is green. It gets a plain note, not an annotation.
+  for (const note of pollNotes(counts)) process.stderr.write(`${note}\n`);
   if (problems.length > 0) process.exit(1);
 }
 
