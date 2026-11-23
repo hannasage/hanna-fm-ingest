@@ -15,7 +15,8 @@ import { MAX_RESPONSE_BYTES, POLL_LIMIT, SPOTIFY_TIMEOUT_MS } from "./settings.t
  *   or invalid, so the login must be renewed and the request is never retried.
  * - Get Recently Played Tracks: GET {api}/me/player/recently-played, scope
  *   user-read-recently-played. `limit` 1 to 50. `after` is a Unix time in milliseconds and
- *   returns items after, not including, that point. Answers: 200, 401, 403, 429.
+ *   returns items after, not including, that point. `before` is the same for items before it.
+ *   Only one of the two may be sent. Answers: 200, 401, 403, 429.
  */
 export const MESSAGES = {
   renew:
@@ -154,18 +155,23 @@ export async function refreshAccessToken(config: SpotifyConfig): Promise<Token> 
   return { accessToken: body.access_token, rotatedRefreshToken: rotated };
 }
 
+/** Where to read from. Spotify refuses `after` and `before` together, so the type allows one at most. */
+export type Paging = { afterMs?: undefined; beforeMs?: undefined } | { afterMs: number; beforeMs?: undefined } | { afterMs?: undefined; beforeMs: number };
+
 /**
- * Asks for the most recent plays, newest first, at most POLL_LIMIT.
- * `afterMs` is the cursor: only plays after that Unix time in milliseconds come back.
+ * Asks for a page of plays, newest first, at most POLL_LIMIT.
+ * `afterMs` returns only plays after that Unix time in milliseconds. `beforeMs` returns only plays before it.
+ * With neither, the newest plays come back.
  * Returns the raw items. They are checked one by one when they are mapped.
  */
 export async function fetchRecentlyPlayed(
   config: SpotifyConfig,
   accessToken: string,
-  afterMs: number | null,
+  paging: Paging,
 ): Promise<unknown[]> {
   const query = new URLSearchParams({ limit: String(POLL_LIMIT) });
-  if (afterMs !== null) query.set("after", String(afterMs));
+  if (paging.afterMs !== undefined) query.set("after", String(paging.afterMs));
+  if (paging.beforeMs !== undefined) query.set("before", String(paging.beforeMs));
   const answer = await send(`${config.apiBase}/me/player/recently-played?${query.toString()}`, {
     method: "GET",
     headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },

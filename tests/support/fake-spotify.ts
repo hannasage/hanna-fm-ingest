@@ -81,23 +81,22 @@ export async function startFakeSpotify(handlers: { token: Handler; recent: Handl
   };
 }
 
-type PlayedItem = { played_at: string };
-
 /**
  * A recently-played handler that behaves like Spotify's paging: newest first, at most `limit`
  * items, `after` and `before` as exclusive Unix times in milliseconds. Spotify refuses both at once,
  * so this answers 400 when it sees both.
  */
-export function recentFrom(all: PlayedItem[]): Handler {
-  const byNewest = [...all].sort((a, b) => Date.parse(b.played_at) - Date.parse(a.played_at));
+export function recentFrom(all: Record<string, unknown>[]): Handler {
+  const time = (item: Record<string, unknown>) => Date.parse(String(item.played_at));
+  const byNewest = [...all].sort((a, b) => time(b) - time(a));
   return (request) => {
     const after = request.query.get("after");
     const before = request.query.get("before");
     if (after !== null && before !== null) return json({ error: { status: 400 } }, 400);
     const limit = Number(request.query.get("limit") ?? "20");
     const items = byNewest
-      .filter((item) => after === null || Date.parse(item.played_at) > Number(after))
-      .filter((item) => before === null || Date.parse(item.played_at) < Number(before))
+      .filter((item) => after === null || time(item) > Number(after))
+      .filter((item) => before === null || time(item) < Number(before))
       .slice(0, limit);
     return json({ href: "https://synthetic.invalid/page", limit, next: null, cursors: null, items });
   };

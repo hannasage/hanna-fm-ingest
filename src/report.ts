@@ -1,5 +1,5 @@
 import { DROP_REASONS, type DropReason } from "./parse.ts";
-import type { PollCounts } from "./poll.ts";
+import { totalSkipped, type PollCounts } from "./poll.ts";
 import { POLL_SKIP_REASONS } from "./poll-mapping.ts";
 
 export type Counts = {
@@ -48,17 +48,19 @@ export function formatReport(counts: Counts, options: { partial?: boolean } = {}
 
 /**
  * Counts only, for the poll. No track, artist or album name ever goes in this text.
- * `fetched` always equals stored + duplicate + skipped.
+ * `fetched` always equals stored + duplicate + skipped, and `duplicate` equals its two parts.
+ * `possible_gap: true` is printed only when the poll stopped short of older plays.
  */
 export function formatPollReport(counts: PollCounts): string {
-  const skipped = POLL_SKIP_REASONS.reduce((sum, reason) => sum + counts.skipped[reason], 0);
   return [
     `fetched: ${counts.fetched}`,
     `stored: ${counts.stored}`,
-    `duplicate: ${counts.duplicate}`,
-    `skipped: ${skipped}`,
+    `duplicate: ${counts.duplicateExport + counts.duplicateExact}`,
+    `  duplicate_export: ${counts.duplicateExport}`,
+    `  duplicate_exact: ${counts.duplicateExact}`,
+    `skipped: ${totalSkipped(counts)}`,
     ...POLL_SKIP_REASONS.map((reason) => `  ${reason}: ${counts.skipped[reason]}`),
-    `possible_gap: ${counts.possibleGap}`,
+    ...(counts.gap === null ? [] : ["possible_gap: true"]),
     "",
   ].join("\n");
 }

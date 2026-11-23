@@ -1,10 +1,11 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { DEDUPE_WINDOW_SECONDS } from "../src/settings.ts";
+import { DEDUPE_WINDOW_SECONDS, POLL_LIMIT, POLL_MAX_PAGES } from "../src/settings.ts";
 import { counts, runPoll, type CliResult } from "./support/cli.ts";
 import { adminClient, localStack } from "./support/env.ts";
 import {
   deadAddress,
   json,
+  recentFrom,
   startFakeSpotify,
   type Answer,
   type FakeSpotify,
@@ -44,6 +45,15 @@ const MSG = {
   network: "Could not reach Spotify. Check the network, then run the poll again.",
   status500: "Spotify answered with an unexpected status (HTTP 500).",
   rotated: "::warning::Spotify issued a new refresh token. Re-authorize and store the new token.",
+  someMalformed: (n: number) =>
+    `${n} item${n === 1 ? "" : "s"} from Spotify could not be read (a field is missing or odd). The readable plays were stored. Check src/poll-mapping.ts against Spotify's answer.`,
+  allSkipped: (n: number) =>
+    `Spotify sent ${n} item${n === 1 ? "" : "s"} and every one was skipped, so nothing was stored. The counts above show why. Check src/poll-mapping.ts against Spotify's answer.`,
+  futureCursor:
+    "The newest stored play is more than 60 seconds in the future, so the poll cannot use it as its starting point. Fix or delete that row, then run the poll again.",
+  stalled:
+    "The poller could not page back to older plays, so it stopped. The plays fetched were stored. Plays older than those may be missing.",
+  capped: "Spotify has more plays than one poll reads (20 pages of 50). The plays fetched were stored. Plays older than those may be missing.",
   tooMany: "Spotify sent more than 50 items in one page, which is more than the poller accepts.",
   tooLarge: "Spotify sent a response larger than 1 MB, so the poller did not read it.",
 };
@@ -128,11 +138,19 @@ async function stored() {
   return data ?? [];
 }
 
+/** The report's parts always add up: fetched = stored + duplicate + skipped, and duplicate = export + exact. */
+function expectBalanced(result: CliResult): void {
+  const c = counts(result.stdout);
+  expect(c.fetched).toBe(c.stored! + c.duplicate! + c.skipped!);
+  expect(c.duplicate).toBe(c.duplicate_export! + c.duplicate_exact!);
+  expect(c.skipped).toBe(c.no_track! + c.malformed!);
+}
+
 const ms = (iso: string) => Date.parse(iso);
 const seconds = (iso: string, delta: number) => new Date(ms(iso) + delta * 1000).toISOString();
 
-/** Puts one play from an export in the table, the way the importer would. */
-async function seedExportPlay(id: number, endedAt: string): Promise<void> {
+/** Puts one play in the table, the way the importer (export) or the poller (poll) would. */
+async function seedPlay(id: number, endedAt: string, source: "export" | "poll"): Promise<void> {
   const tag = String(id).padStart(12, "0");
   const { error } = await db.from("plays").insert({
     track_uri: `spotify:track:SYNTH${tag}`,
@@ -140,11 +158,13 @@ async function seedExportPlay(id: number, endedAt: string): Promise<void> {
     artist_name: `Synthetic Artist ${id}`,
     album_name: `Synthetic Album ${id}`,
     ended_at: endedAt,
-    ms_played: 200000,
-    source: "export",
+    ms_played: source === "export" ? 200000 : null,
+    source,
   });
   if (error) throw new Error(`Could not seed a play: ${error.code}`);
 }
+
+const seedExportPlay = (id: number, endedAt: string) => seedPlay(id, endedAt, "export");
 
 const T0 = "2026-11-20T10:00:00.000Z";
 
@@ -159,8 +179,18 @@ describe("poll: storing plays", () => {
 
     expect(result.status).toBe(0);
     expect(result.stderr).toBe("");
-    expect(counts(result.stdout)).toEqual({ fetched: 3, stored: 3, duplicate: 0, skipped: 0, no_track: 0, malformed: 0 });
-    expect(result.stdout).toContain("possible_gap: false");
+    expect(counts(result.stdout)).toEqual({
+      fetched: 3,
+      stored: 3,
+      duplicate: 0,
+      duplicate_export: 0,
+      duplicate_exact: 0,
+      skipped: 0,
+      no_track: 0,
+      malformed: 0,
+    });
+    expect(result.stdout).not.toContain("possible_gap");
+    expectBalanced(result);
 
     // The token request follows the refresh-token page: form body, Basic login.
     expect(fake.tokenRequests).toHaveLength(1);
@@ -204,10 +234,13 @@ describe("poll: storing plays", () => {
     const items = [item(1, "2026-11-20T10:00:05.678Z"), item(2, "2026-11-20T10:04:09.001Z")];
     const first = await poll({ recent: () => page(items) });
     expect(counts(first.result.stdout)).toMatchObject({ fetched: 2, stored: 2, duplicate: 0 });
+    expectBalanced(first.result);
 
     const second = await poll({ recent: () => page(items) });
     expect(second.result.status).toBe(0);
-    expect(counts(second.result.stdout)).toMatchObject({ fetched: 2, stored: 0, duplicate: 2 });
+    // Two poll rows already hold these exact keys, so the table's key refuses them.
+    expect(counts(second.result.stdout)).toMatchObject({ fetched: 2, stored: 0, duplicate: 2, duplicate_exact: 2, duplicate_export: 0 });
+    expectBalanced(second.result);
     expect(await stored()).toHaveLength(2);
     // The cursor is the latest stored end time in milliseconds (whole seconds, as stored).
     expect(second.fake.recentRequests[0]!.query.get("after")).toBe(String(ms("2026-11-20T10:04:09.000Z")));
@@ -225,11 +258,12 @@ describe("poll: storing plays", () => {
     const { result } = await poll({ recent: () => page(items) });
 
     expect(result.status).toBe(0);
-    expect(counts(result.stdout)).toEqual({ fetched: 6, stored: 1, duplicate: 0, skipped: 5, no_track: 5, malformed: 0 });
+    expect(counts(result.stdout)).toMatchObject({ fetched: 6, stored: 1, duplicate: 0, skipped: 5, no_track: 5, malformed: 0 });
+    expectBalanced(result);
     expect(await stored()).toHaveLength(1);
   });
 
-  it("skips an item with a missing or invalid field as malformed, and keeps going", async () => {
+  it("skips an item with a missing or invalid field as malformed, stores the valid ones, then exits 1", async () => {
     const items = [
       item(1, "not a date"),
       item(2, "2026-11-20T10:01:00Z", { name: "" }),
@@ -240,35 +274,36 @@ describe("poll: storing plays", () => {
     ];
     const { result } = await poll({ recent: () => page(items as Item[]) });
 
-    expect(result.status).toBe(0);
-    expect(counts(result.stdout)).toEqual({ fetched: 6, stored: 1, duplicate: 0, skipped: 5, no_track: 0, malformed: 5 });
+    expect(result.status).toBe(1);
+    expect(counts(result.stdout)).toMatchObject({ fetched: 6, stored: 1, duplicate: 0, skipped: 5, no_track: 0, malformed: 5 });
+    expectBalanced(result);
     expect(await stored()).toHaveLength(1);
+    expect(result.stderr).toBe(`::error::${MSG.someMalformed(5)}\n`);
+    expectNoSecrets(result);
   });
 
   it("handles an empty page", async () => {
     const { result } = await poll({ recent: () => page([]) });
     expect(result.status).toBe(0);
-    expect(counts(result.stdout)).toEqual({ fetched: 0, stored: 0, duplicate: 0, skipped: 0, no_track: 0, malformed: 0 });
+    expect(counts(result.stdout)).toMatchObject({ fetched: 0, stored: 0, duplicate: 0, skipped: 0, no_track: 0, malformed: 0 });
+    expect(result.stderr).toBe("");
   });
 
   it("stores a play that is the same twice in one answer only once", async () => {
     const items = [item(1, "2026-11-20T10:00:05.100Z"), item(1, "2026-11-20T10:00:05.900Z")];
     const { result } = await poll({ recent: () => page(items) });
-    expect(counts(result.stdout)).toMatchObject({ fetched: 2, stored: 1, duplicate: 1 });
+    expect(counts(result.stdout)).toMatchObject({ fetched: 2, stored: 1, duplicate: 1, duplicate_exact: 1 });
+    expectBalanced(result);
     expect(await stored()).toHaveLength(1);
   });
 });
 
 describe("poll: matching plays already stored", () => {
-  it("settings: the window is one named setting, 10 seconds by default", () => {
-    expect(DEDUPE_WINDOW_SECONDS).toBe(10);
-  });
-
   it("does not store a play already imported from an export, at the exact end time", async () => {
     await seedExportPlay(1, "2026-11-20T10:00:05Z");
     const { result } = await poll({ recent: () => page([item(1, "2026-11-20T10:00:05.678Z")]) });
 
-    expect(counts(result.stdout)).toMatchObject({ fetched: 1, stored: 0, duplicate: 1 });
+    expect(counts(result.stdout)).toMatchObject({ fetched: 1, stored: 0, duplicate: 1, duplicate_export: 1, duplicate_exact: 0 });
     const rows = await stored();
     expect(rows).toHaveLength(1);
     expect(rows[0]!.source).toBe("export");
@@ -278,7 +313,7 @@ describe("poll: matching plays already stored", () => {
     await seedExportPlay(1, "2026-11-20T10:00:00Z");
     const { result } = await poll({ recent: () => page([item(1, "2026-11-20T10:00:05.678Z")]) });
 
-    expect(counts(result.stdout)).toMatchObject({ fetched: 1, stored: 0, duplicate: 1 });
+    expect(counts(result.stdout)).toMatchObject({ fetched: 1, stored: 0, duplicate: 1, duplicate_export: 1 });
     expect(await stored()).toHaveLength(1);
   });
 
@@ -294,7 +329,8 @@ describe("poll: matching plays already stored", () => {
     ];
     const { result } = await poll({ recent: () => page(items) });
 
-    expect(counts(result.stdout)).toMatchObject({ fetched: 4, stored: 2, duplicate: 2 });
+    expect(counts(result.stdout)).toMatchObject({ fetched: 4, stored: 2, duplicate: 2, duplicate_export: 2 });
+    expectBalanced(result);
     const polled = (await stored()).filter((row) => row.source === "poll");
     expect(polled.map((row) => row.track_uri).sort()).toEqual([
       "spotify:track:SYNTH000000000002",
@@ -308,23 +344,208 @@ describe("poll: matching plays already stored", () => {
     expect(counts(result.stdout)).toMatchObject({ stored: 1, duplicate: 0 });
     expect(await stored()).toHaveLength(2);
   });
-});
 
-describe("poll: possible gap", () => {
-  const many = (count: number) =>
-    Array.from({ length: count }, (_, index) => item(index + 1, seconds("2026-11-20T10:00:00Z", index * 200)));
-
-  it("prints possible_gap: true and exits 0 when exactly 50 plays come back", async () => {
-    const { result } = await poll({ recent: () => page(many(50)) });
+  it("keeps a replay of the same track inside the window when the stored play is a poll row", async () => {
+    await seedPlay(1, T0, "poll");
+    const { result } = await poll({ recent: recentFrom([item(1, seconds(T0, 5))]) });
     expect(result.status).toBe(0);
-    expect(counts(result.stdout)).toMatchObject({ fetched: 50, stored: 50 });
-    expect(result.stdout).toContain("possible_gap: true");
+    expect(counts(result.stdout)).toMatchObject({ fetched: 1, stored: 1, duplicate: 0 });
+    expect((await stored()).map((row) => row.source)).toEqual(["poll", "poll"]);
   });
 
-  it("prints possible_gap: false for 49 plays", async () => {
-    const { result } = await poll({ recent: () => page(many(49)) });
-    expect(result.stdout).toContain("possible_gap: false");
-    expect(result.stdout).not.toContain("possible_gap: true");
+  it("drops that same replay when the stored play is an export row", async () => {
+    await seedExportPlay(1, T0);
+    const { result } = await poll({ recent: recentFrom([item(1, seconds(T0, 5))]) });
+    expect(counts(result.stdout)).toMatchObject({ fetched: 1, stored: 0, duplicate: 1, duplicate_export: 1, duplicate_exact: 0 });
+    expect(await stored()).toHaveLength(1);
+  });
+
+  it("keeps two plays of one track a few seconds apart in the same answer, because the exact key tells them apart", async () => {
+    const { result } = await poll({ recent: () => page([item(1, seconds(T0, 0)), item(1, seconds(T0, 5))]) });
+    expect(counts(result.stdout)).toMatchObject({ fetched: 2, stored: 2, duplicate: 0 });
+  });
+
+  it("counts a repeat of an export play and a repeat of a poll play apart, and the parts add up", async () => {
+    await seedExportPlay(1, T0);
+    await seedPlay(2, T0, "poll");
+    const items = [item(1, seconds(T0, 3)), item(2, T0), item(3, seconds(T0, 20))];
+    const { result } = await poll({ recent: () => page(items) });
+    expect(result.status).toBe(0);
+    expect(counts(result.stdout)).toMatchObject({
+      fetched: 3,
+      stored: 1,
+      duplicate: 2,
+      duplicate_export: 1,
+      duplicate_exact: 1,
+    });
+    expectBalanced(result);
+  });
+});
+
+describe("poll: paging back over a full page", () => {
+  const T = "2026-11-20T08:00:00Z";
+  /** `count` plays, one every 100 seconds from `start`, with ids from `firstId`. */
+  const run = (count: number, start: string, firstId: number) =>
+    Array.from({ length: count }, (_, index) => item(firstId + index, seconds(start, index * 100)));
+
+  it("recovers every play when a full page is followed by older plays", async () => {
+    const all = run(120, T, 1);
+    const { result, fake } = await poll({ recent: recentFrom(all) });
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(counts(result.stdout)).toMatchObject({ fetched: 120, stored: 120, duplicate: 0, skipped: 0 });
+    expect(result.stdout).not.toContain("possible_gap");
+    expectBalanced(result);
+    expect(await stored()).toHaveLength(120);
+
+    // Three pages: no cursor, then `before` the oldest play of the page before. Never both parameters.
+    expect(fake.recentRequests).toHaveLength(3);
+    const [first, second, third] = fake.recentRequests.map((request) => request.query);
+    expect(first!.has("after") || first!.has("before")).toBe(false);
+    const newestFirst = [...all].sort((a, b) => ms(b.played_at as string) - ms(a.played_at as string));
+    expect(second!.get("before")).toBe(String(ms(newestFirst[49]!.played_at as string)));
+    expect(second!.has("after")).toBe(false);
+    expect(third!.get("before")).toBe(String(ms(newestFirst[99]!.played_at as string)));
+    expect(third!.has("after")).toBe(false);
+  });
+
+  it("asks with `after` first when a play is stored, then pages back with `before` only", async () => {
+    await seedPlay(900, seconds(T, -1000), "poll");
+    const { result, fake } = await poll({ recent: recentFrom(run(120, T, 1)) });
+
+    expect(result.status).toBe(0);
+    expect(counts(result.stdout)).toMatchObject({ fetched: 120, stored: 120 });
+    expect(fake.recentRequests).toHaveLength(3);
+    const [first, second] = fake.recentRequests.map((request) => request.query);
+    expect(first!.get("after")).toBe(String(ms(seconds(T, -1000))));
+    expect(first!.has("before")).toBe(false);
+    expect(second!.has("after")).toBe(false);
+    expect(second!.has("before")).toBe(true);
+  });
+
+  it("stops when a page holds only plays at or before the stored cursor", async () => {
+    const cursor = seconds(T, 6000);
+    await seedPlay(900, cursor, "poll");
+    // 60 plays after the cursor, then 90 at or before it.
+    const newer = run(60, seconds(cursor, 100), 1);
+    const older = run(90, seconds(cursor, -9000), 100);
+    const { result, fake } = await poll({ recent: recentFrom([...newer, ...older]) });
+
+    expect(result.status).toBe(0);
+    // Page 1 (after): 50 newer. Page 2 (before): 10 newer and 40 older. Page 3: 50 older, all at or before the cursor, so it stops.
+    expect(fake.recentRequests).toHaveLength(3);
+    expect(counts(result.stdout)).toMatchObject({ fetched: 150, stored: 150 });
+    expectBalanced(result);
+  });
+
+  it("stops at once when the first page is not full", async () => {
+    const { fake } = await poll({ recent: recentFrom(run(POLL_LIMIT - 1, T, 1)) });
+    expect(fake.recentRequests).toHaveLength(1);
+  });
+
+  it("stops on an empty page after a full one", async () => {
+    const { result, fake } = await poll({ recent: recentFrom(run(POLL_LIMIT, T, 1)) });
+    expect(result.status).toBe(0);
+    expect(fake.recentRequests).toHaveLength(2);
+    expect(counts(result.stdout)).toMatchObject({ fetched: POLL_LIMIT, stored: POLL_LIMIT });
+  });
+
+  it("stores what it fetched, then exits 1 with a plain message, when it reaches the page cap", async () => {
+    const all = run(POLL_MAX_PAGES * POLL_LIMIT + 50, T, 1);
+    const { result, fake } = await poll({ recent: recentFrom(all) });
+
+    expect(fake.recentRequests).toHaveLength(POLL_MAX_PAGES);
+    expect(result.status).toBe(1);
+    expect(counts(result.stdout)).toMatchObject({ fetched: POLL_MAX_PAGES * POLL_LIMIT, stored: POLL_MAX_PAGES * POLL_LIMIT });
+    expect(result.stdout).toContain("possible_gap: true");
+    expect(result.stderr).toBe(`::error::${MSG.capped}\n`);
+    expect(await stored()).toHaveLength(POLL_MAX_PAGES * POLL_LIMIT);
+    expectNoSecrets(result);
+  });
+
+  it("does not loop when Spotify ignores `before` and sends the same page again", async () => {
+    const same = run(POLL_LIMIT, T, 1);
+    const { result, fake } = await poll({ recent: () => page(same) });
+    expect(fake.recentRequests).toHaveLength(2);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("possible_gap: true");
+    expect(result.stderr).toBe(`::error::${MSG.stalled}\n`);
+    expect(counts(result.stdout)).toMatchObject({ fetched: POLL_LIMIT, stored: POLL_LIMIT });
+    expect(await stored()).toHaveLength(POLL_LIMIT);
+  });
+});
+
+describe("poll: failing loudly", () => {
+  it("exits 1 when every item was skipped (a renamed field), with an error annotation", async () => {
+    const renamed = [item(1, "2026-11-20T10:00:00Z"), item(2, "2026-11-20T10:01:00Z")].map((entry) => {
+      const track: Record<string, unknown> = { ...(entry.track as Record<string, unknown>), title: "x" };
+      delete track.name;
+      return { ...entry, track };
+    });
+    const { result } = await poll({ recent: () => page(renamed) });
+
+    expect(result.status).toBe(1);
+    expect(counts(result.stdout)).toMatchObject({ fetched: 2, stored: 0, skipped: 2, malformed: 2 });
+    expect(result.stderr).toBe(`::error::${MSG.allSkipped(2)}\n`);
+    expect(await stored()).toHaveLength(0);
+    expectNoSecrets(result);
+  });
+
+  it("exits 1 when every item is a local file or an episode", async () => {
+    const items = [item(1, "2026-11-20T10:00:00Z", { is_local: true }), item(2, "2026-11-20T10:01:00Z", { type: "episode" })];
+    const { result } = await poll({ recent: () => page(items) });
+    expect(result.status).toBe(1);
+    expect(counts(result.stdout)).toMatchObject({ fetched: 2, stored: 0, no_track: 2 });
+    expect(result.stderr).toBe(`::error::${MSG.allSkipped(2)}\n`);
+  });
+
+  it("exits 0 when some items are skipped as no_track and others are stored", async () => {
+    const items = [item(1, "2026-11-20T10:00:00Z", { is_local: true }), item(2, "2026-11-20T10:01:00Z")];
+    const { result } = await poll({ recent: () => page(items) });
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+  });
+
+  it("exits 0 when every item is already stored", async () => {
+    const items = [item(1, "2026-11-20T10:00:00Z")];
+    await poll({ recent: () => page(items) });
+    const again = await poll({ recent: () => page(items) });
+    expect(again.result.status).toBe(0);
+  });
+});
+
+describe("poll: dates in the future", () => {
+  const inFuture = (secondsAhead: number) => new Date(Date.now() + secondsAhead * 1000).toISOString();
+
+  it("rejects a play stamped more than 60 seconds ahead as malformed, after storing the good ones", async () => {
+    const items = [item(1, "2026-11-20T10:00:00Z"), item(2, inFuture(3600))];
+    const { result } = await poll({ recent: () => page(items) });
+    expect(result.status).toBe(1);
+    expect(counts(result.stdout)).toMatchObject({ fetched: 2, stored: 1, malformed: 1 });
+    expect(result.stderr).toBe(`::error::${MSG.someMalformed(1)}\n`);
+    expect((await stored()).map((row) => row.track_uri)).toEqual(["spotify:track:SYNTH000000000001"]);
+  });
+
+  it("accepts a play stamped a few seconds ahead of the clock", async () => {
+    const { result } = await poll({ recent: () => page([item(1, inFuture(30))]) });
+    expect(result.status).toBe(0);
+    expect(counts(result.stdout)).toMatchObject({ stored: 1, malformed: 0 });
+  });
+
+  it("exits 1 naming the problem when the stored cursor is more than 60 seconds ahead, before it uses the login", async () => {
+    await seedExportPlay(1, inFuture(3600));
+    const { result, fake } = await poll({ recent: () => page([item(2, "2026-11-20T10:00:00Z")]) });
+    expectFailure(result, MSG.futureCursor);
+    expect(result.stderr).not.toContain("::error::");
+    expect(fake.tokenRequests).toHaveLength(0);
+    expect(await stored()).toHaveLength(1);
+  });
+
+  it("goes on when the stored cursor is only a few seconds ahead", async () => {
+    await seedExportPlay(1, inFuture(30));
+    const { result } = await poll({ recent: () => page([]) });
+    expect(result.status).toBe(0);
   });
 });
 
@@ -511,9 +732,21 @@ describe("poll: no secret in any output", () => {
 });
 
 describe("poll: two at once", () => {
-  it("stores each play once when two polls run together", async () => {
+  it("stores each play once when two polls run together, both holding their answers until both have asked", async () => {
     const items = Array.from({ length: 8 }, (_, index) => item(index + 1, seconds("2026-11-20T10:00:00Z", index * 200)));
-    const fake = await startFakeSpotify({ token: () => tokenOk(), recent: () => page(items) });
+    let asked = 0;
+    let release: () => void = () => {};
+    const bothAsked = new Promise<void>((resolve) => (release = resolve));
+    const fake = await startFakeSpotify({
+      token: () => tokenOk(),
+      // A start barrier: neither answer goes out until both polls have read the empty table and asked.
+      recent: async () => {
+        asked += 1;
+        if (asked === 2) release();
+        await Promise.race([bothAsked, new Promise((resolve) => setTimeout(resolve, 15_000))]);
+        return page(items);
+      },
+    });
     try {
       const env = {
         SPOTIFY_CLIENT_ID: CLIENT_ID,
@@ -523,11 +756,12 @@ describe("poll: two at once", () => {
         SPOTIFY_API_BASE: fake.url,
       };
       const [a, b] = await Promise.all([runPoll(env), runPoll(env)]);
+      // Both were waiting at the same time, so the two polls really overlapped.
+      expect(asked).toBe(2);
       expect(a.status).toBe(0);
       expect(b.status).toBe(0);
-      const storedByEach = counts(a.stdout).stored! + counts(b.stdout).stored!;
-      expect(storedByEach).toBe(8);
-      expect(counts(a.stdout).duplicate! + counts(b.stdout).duplicate!).toBe(8);
+      expect(counts(a.stdout).stored! + counts(b.stdout).stored!).toBe(8);
+      expect(counts(a.stdout).duplicate_exact! + counts(b.stdout).duplicate_exact!).toBe(8);
       const rows = await stored();
       expect(rows).toHaveLength(8);
       expect(new Set(rows.map((row) => row.track_uri)).size).toBe(8);
