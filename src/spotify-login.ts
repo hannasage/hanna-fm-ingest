@@ -1,9 +1,10 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { UserError } from "./files.ts";
 import {
   LOGIN_PORT_MIN,
   LOGIN_STATE_BYTES,
+  LOGIN_VERIFIER_BYTES,
   SPOTIFY_REDIRECT_URI,
 } from "./settings.ts";
 import { isRecord, send } from "./spotify.ts";
@@ -21,7 +22,12 @@ import { isRecord, send } from "./spotify.ts";
  *   expires_in and refresh_token.
  * - Redirect URIs: the address in the request must exactly match one registered in the app. A loopback address
  *   is allowed over plain http, but only as the IP literal (http://127.0.0.1:PORT), never `localhost`.
- * - Scopes: the names this tool asks for are in LOGIN_SCOPES, each on the Scopes page.
+ * - Authorization Code with PKCE Flow: the app makes a code verifier (43 to 128 characters of letters, digits, `_`,
+ *   `.`, `-` and `~`), hashes it with SHA-256 and writes the hash in base64url with no padding: the code challenge.
+ *   The authorize request adds code_challenge and code_challenge_method=S256. The token request adds client_id and
+ *   code_verifier. That page's token request has no client secret. This tool sends its Basic header as well, so
+ *   PKCE is a second check on top of the secret, not a replacement for it.
+ * - Scopes: the names this tool requests are in LOGIN_SCOPES, each on the Scopes page.
  * - Refreshing tokens: a refresh token lasts 6 months from authorization, and refreshing does not extend it.
  *
  * Every message here is fixed text. None quotes the client secret, the code, a token, a response body or a
@@ -37,7 +43,6 @@ export const loginMessages = {
   timeout: "Spotify did not send the browser back within 5 minutes. Run the command again.",
   denied: "Spotify did not get your approval. Run the command again, open the address, and choose to agree.",
   refused: "Spotify reported an authorization error. Run the command again.",
-  badState: "The callback did not carry the state this run made, so it was refused. Run the command again.",
   noCode: "The callback carried no authorization code. Run the command again.",
   grant:
     "Spotify refused the code. It may be used or expired, or the redirect address may differ from the one registered in the Spotify app. Run the command again.",
@@ -56,6 +61,10 @@ export const loginMessages = {
   notConfigured: (date: string) =>
     `The login date was not recorded, because SUPABASE_URL and SUPABASE_SECRET_KEY are not both set. To record it, run: npm run set-state -- spotify_authorized_at ${date}`,
   notGranted: (names: string[]) => `Spotify did not grant these requested scopes: ${names.join(", ")}.`,
+  /** The body of a 400 for a request that is not from this run. The listener keeps waiting. */
+  ignoredReply: "This request was refused. The login is still waiting for Spotify.\n",
+  clearReminder:
+    "Copy the token into the GitHub environment secret SPOTIFY_REFRESH_TOKEN now. Then clear this terminal and its scrollback, because terminals, tmux and screen recorders can keep it: clear && printf '\\e[3J'",
 } as const;
 
 /** The redirect address, with the port from SPOTIFY_LOGIN_PORT when that is set. Throws a UserError for a bad port. */
@@ -90,7 +99,7 @@ export type LoginOptions = {
 
 type Outcome =
   | { kind: "code"; code: string }
-  | { kind: "denied" | "refused" | "state" | "nocode" | "timeout" | "listen" }
+  | { kind: "denied" | "refused" | "nocode" | "timeout" | "listen" }
   | { kind: "busy"; port: number };
 
 const CODE_MAX_CHARS = 4096;
@@ -102,19 +111,21 @@ function sameText(a: string, b: string): boolean {
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
-/** Decides what a request to the callback path means. The state is checked first, as Spotify's page says. */
-function judge(query: string, state: string): Outcome {
+/**
+ * Decides what a request to the callback path means. `ignore` is a request that cannot be from Spotify's redirect
+ * for this run: a wrong, missing or repeated state, or a repeated code or error. It does not end the run.
+ * The state is checked first, as Spotify's page says.
+ */
+function judge(query: string, state: string): Outcome | { kind: "ignore" } {
   const params = new URLSearchParams(query);
-  const states = params.getAll("state");
-  const sent = states[0];
-  if (states.length !== 1 || sent === undefined || !sameText(sent, state)) return { kind: "state" };
-  if (params.has("error")) {
-    const errors = params.getAll("error");
-    return { kind: errors.length === 1 && errors[0] === "access_denied" ? "denied" : "refused" };
+  for (const name of ["state", "code", "error"]) {
+    if (params.getAll(name).length > 1) return { kind: "ignore" };
   }
-  const codes = params.getAll("code");
-  const code = codes[0];
-  if (codes.length !== 1 || code === undefined || code === "" || code.length > CODE_MAX_CHARS) return { kind: "nocode" };
+  const sent = params.get("state");
+  if (sent === null || !sameText(sent, state)) return { kind: "ignore" };
+  if (params.has("error")) return { kind: params.get("error") === "access_denied" ? "denied" : "refused" };
+  const code = params.get("code");
+  if (code === null || code === "" || code.length > CODE_MAX_CHARS) return { kind: "nocode" };
   return { kind: "code", code };
 }
 
@@ -126,9 +137,12 @@ const HEADERS = {
 } as const;
 
 /**
- * Listens on 127.0.0.1 only. Exactly one GET to the callback path counts: it closes the listener at once, and
- * the first request to it decides the run, whatever it holds. Any other path gets 404, and a callback that is not
- * a GET gets 405. Neither uses up the one request.
+ * Listens on 127.0.0.1 only. A request counts only when its Host header is exactly `127.0.0.1:<port>`: any other
+ * Host gets 400, so a web page that points a name at this computer cannot use the listener. Any other path gets
+ * 404, and a callback that is not a GET gets 405. A GET to the callback path with this run's state ends the run
+ * and closes the listener at once. A GET with a wrong, missing or repeated state gets 400 and the listener keeps
+ * waiting until the timer ends, so a stray request from another page cannot end the run. None of these uses up
+ * the run.
  * `onListening` runs once the port is held, so the address is never shown before it can be answered.
  */
 function waitForCallback(spec: {
@@ -155,14 +169,18 @@ function waitForCallback(spec: {
         response.end(text, done);
       };
 
+      // Host first, even before the path: a page that rebinds a name to 127.0.0.1 learns nothing from a 404.
+      if (request.headers.host !== `${spec.host}:${spec.port}`) return reply(400, loginMessages.ignoredReply);
       if (consumed || path !== spec.path) return reply(404, "Not found.\n");
       if (request.method !== "GET") return reply(405, "Use GET.\n", { allow: "GET" });
+
+      const outcome = judge(query, spec.state);
+      if (outcome.kind === "ignore") return reply(400, loginMessages.ignoredReply);
 
       consumed = true;
       clearTimeout(timer);
       // Stop accepting at once, so a second request is refused while the exchange is still running.
       server.close();
-      const outcome = judge(query, spec.state);
       const text =
         outcome.kind === "code"
           ? "Spotify sent you back. Return to the terminal: the login finishes there. You can close this tab.\n"
@@ -193,14 +211,20 @@ const PRINTABLE_TOKEN = /^[\x21-\x7e]{1,4096}$/;
 const PRINTABLE_SCOPES = /^[\x21-\x7e]+( [\x21-\x7e]+)*$/;
 
 /** Trades the code for the tokens. Returns the refresh token and the granted scope string. Throws a UserError. */
-async function exchangeCode(options: LoginOptions, code: string): Promise<{ refreshToken: string; scope: string }> {
+async function exchangeCode(options: LoginOptions, code: string, verifier: string): Promise<{ refreshToken: string; scope: string }> {
   const login = Buffer.from(`${options.clientId}:${options.clientSecret}`).toString("base64");
   let answer;
   try {
     answer = await send(`${options.accountsBase}/api/token`, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded", Authorization: `Basic ${login}` },
-      body: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: options.redirectUri }),
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: options.redirectUri,
+        client_id: options.clientId,
+        code_verifier: verifier,
+      }),
     });
   } catch (error) {
     // `send` words its failures for the poller. Say them again for this command, by kind.
@@ -241,7 +265,6 @@ async function exchangeCode(options: LoginOptions, code: string): Promise<{ refr
 const STOPS: Record<Exclude<Outcome["kind"], "code" | "busy">, string> = {
   denied: loginMessages.denied,
   refused: loginMessages.refused,
-  state: loginMessages.badState,
   nocode: loginMessages.noCode,
   timeout: loginMessages.timeout,
   listen: loginMessages.listen,
@@ -258,6 +281,10 @@ export async function runLogin(options: LoginOptions): Promise<number> {
 
   const redirect = new URL(options.redirectUri);
   const state = randomBytes(LOGIN_STATE_BYTES).toString("base64url");
+  // The verifier stays in this function: it is sent once, in the token request, and never printed or logged.
+  // 96 random bytes in base64url is 128 characters from A-Z, a-z, 0-9, `-` and `_`, all allowed by Spotify's page.
+  const verifier = randomBytes(LOGIN_VERIFIER_BYTES).toString("base64url");
+  const challenge = createHash("sha256").update(verifier, "ascii").digest("base64url");
   const authorize = new URL(`${options.accountsBase}/authorize`);
   // A space is written %20, as Spotify's own example does, not +.
   authorize.search = new URLSearchParams({
@@ -266,6 +293,8 @@ export async function runLogin(options: LoginOptions): Promise<number> {
     scope: options.scopes.join(" "),
     redirect_uri: options.redirectUri,
     state,
+    code_challenge_method: "S256",
+    code_challenge: challenge,
   })
     .toString()
     .replace(/\+/g, "%20");
@@ -293,7 +322,7 @@ export async function runLogin(options: LoginOptions): Promise<number> {
 
   let granted: { refreshToken: string; scope: string };
   try {
-    granted = await exchangeCode(options, outcome.code);
+    granted = await exchangeCode(options, outcome.code, verifier);
   } catch (error) {
     err(`${error instanceof UserError ? error.message : loginMessages.network}\n`);
     return 1;
@@ -305,6 +334,8 @@ export async function runLogin(options: LoginOptions): Promise<number> {
   if (missing.length > 0) err(`${loginMessages.notGranted(missing)}\n`);
   // On its own line, once. Store it as the SPOTIFY_REFRESH_TOKEN secret. Never paste it anywhere else.
   out(`SPOTIFY_REFRESH_TOKEN=${granted.refreshToken}\n`);
+  // Terminals, tmux and recorders can keep what was printed. Say so while the token is on screen.
+  err(`${loginMessages.clearReminder}\n`);
 
   const date = (options.now?.() ?? new Date()).toISOString().slice(0, 10);
   if (options.recordAuthorized === null) {

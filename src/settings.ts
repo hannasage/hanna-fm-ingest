@@ -148,12 +148,27 @@ export const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 export const LOGIN_STATE_BYTES = 32;
 
 /**
- * The scopes `spotify-login` asks for. Each name is on Spotify's Scopes page. The refresh token carries exactly
- * these, so adding one here means authorizing again.
+ * Random bytes behind the PKCE code verifier. 96 bytes written in base64url is exactly 128 characters, the most
+ * Spotify's PKCE page allows (43 to 128, "the longer the better"), with no padding and no bias from a modulo.
+ */
+export const LOGIN_VERIFIER_BYTES = 96;
+
+/**
+ * The scopes `spotify-login` requests. Each name is on Spotify's Scopes page. The refresh token carries exactly
+ * these, so a scope added here means logging in again. Request the least that works: only the poller's scope now.
  */
 export const LOGIN_SCOPES = [
   // The poller: GET /me/player/recently-played.
   "user-read-recently-played",
+] as const;
+
+/**
+ * Scopes that a later feature adds. NOT requested today, and the login never reads this list. It is here so the
+ * names are checked against Spotify's Scopes page now and are ready when the feature is built.
+ * To add one: move its name into LOGIN_SCOPES in the same change as the feature, then run `spotify-login` again
+ * (that also restarts the six month clock) and store the new token as the SPOTIFY_REFRESH_TOKEN secret.
+ */
+export const LATER_LOGIN_SCOPES = [
   // A later Now playing strip: GET /me/player/currently-playing.
   "user-read-currently-playing",
   // A later playlist picker: the list of the person's private playlists.

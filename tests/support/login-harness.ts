@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { request as httpRequest } from "node:http";
-import { createServer, type Server } from "node:net";
+import { connect, createServer, type Server } from "node:net";
 import { join } from "node:path";
 import { prepare } from "./cli.ts";
 import { runLogin, type LoginOptions } from "../../src/spotify-login.ts";
@@ -41,10 +42,10 @@ export type Reply = { status: number; body: string; headers: Record<string, stri
  * A real HTTP request to the helper's listener. A new connection every time, so a closed listener shows as a
  * refused connection. It rejects with the network error code (ECONNREFUSED) when nothing answers.
  */
-export function hit(port: number, path: string, method = "GET"): Promise<Reply> {
+export function hit(port: number, path: string, method = "GET", headers: Record<string, string> = {}): Promise<Reply> {
   return new Promise((resolve, reject) => {
     const req = httpRequest(
-      { host: "127.0.0.1", port, path, method, agent: false, headers: { connection: "close" } },
+      { host: "127.0.0.1", port, path, method, agent: false, headers: { connection: "close", ...headers } },
       (response) => {
         const chunks: Buffer[] = [];
         response.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -56,6 +57,27 @@ export function hit(port: number, path: string, method = "GET"): Promise<Reply> 
     req.on("error", (error: NodeJS.ErrnoException) => reject(new Error(error.code ?? "network")));
     req.end();
   });
+}
+
+/**
+ * A request written by hand on a raw socket, so it can leave out the Host header (HTTP/1.0 allows that) or send
+ * it empty. `headerLines` are written as given. Resolves with the status code of the answer.
+ */
+export function hitRaw(port: number, path: string, headerLines: string[] = []): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const socket = connect({ host: "127.0.0.1", port });
+    let text = "";
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.write(`GET ${path} HTTP/1.0\r\n${headerLines.map((line) => `${line}\r\n`).join("")}\r\n`));
+    socket.on("data", (chunk: string) => (text += chunk));
+    socket.on("end", () => resolve(Number(/^HTTP\/1\.\d (\d{3})/.exec(text)?.[1] ?? 0)));
+    socket.on("error", (error: NodeJS.ErrnoException) => reject(new Error(error.code ?? "network")));
+  });
+}
+
+/** The S256 code challenge for a verifier, worked out here on its own: base64url of the SHA-256 hash, no padding. */
+export function challengeFor(verifier: string): string {
+  return createHash("sha256").update(verifier, "ascii").digest("base64url");
 }
 
 /** True when nothing accepts a connection on the port. */

@@ -1,7 +1,7 @@
 import { request } from "node:http";
 import { networkInterfaces } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { LOGIN_SCOPES, SPOTIFY_REDIRECT_URI } from "../src/settings.ts";
+import { LATER_LOGIN_SCOPES, LOGIN_SCOPES, SPOTIFY_REDIRECT_URI } from "../src/settings.ts";
 import { loginMessages, loginRedirectUri, runLogin } from "../src/spotify-login.ts";
 import { setState } from "../src/set-state.ts";
 import { adminClient } from "./support/env.ts";
@@ -13,9 +13,11 @@ import {
   CLIENT_SECRET,
   CODE,
   REFRESH_TOKEN,
+  challengeFor,
   expectNoSecrets,
   freePort,
   hit,
+  hitRaw,
   isClosed,
   occupy,
   startLogin,
@@ -36,6 +38,20 @@ const GOOD_TOKEN = {
 
 let fake: FakeSpotify;
 let answer: Handler;
+
+/**
+ * A token answer that checks PKCE the way Spotify does: the form's code_verifier, hashed with SHA-256 and written
+ * in base64url, must equal the code_challenge the authorization request carried. Otherwise it refuses the code.
+ */
+function checkingPkce(challenge: string | null): Handler {
+  return (seen) => {
+    const verifier = new URLSearchParams(seen.body).get("code_verifier");
+    if (challenge === null || verifier === null || challengeFor(verifier) !== challenge) {
+      return json({ error: "invalid_grant", error_description: BODY_MARKER }, 400);
+    }
+    return json(GOOD_TOKEN);
+  };
+}
 
 beforeEach(async () => {
   answer = () => json(GOOD_TOKEN);
@@ -60,9 +76,17 @@ describe("the settings", () => {
     expect(SPOTIFY_REDIRECT_URI).toBe("http://127.0.0.1:8765/callback");
   });
 
-  it("asks for three scopes, each on Spotify's Scopes page", () => {
-    expect([...LOGIN_SCOPES]).toEqual(["user-read-recently-played", "user-read-currently-playing", "playlist-read-private"]);
+  it("requests only the scope the poller needs, and it is on Spotify's Scopes page", () => {
+    expect([...LOGIN_SCOPES]).toEqual(["user-read-recently-played"]);
     for (const scope of LOGIN_SCOPES) expect(SPOTIFY_SCOPE_NAMES).toContain(scope);
+  });
+
+  it("lists the scopes a later feature adds, each on Spotify's Scopes page, and requests none of them", () => {
+    expect([...LATER_LOGIN_SCOPES]).toEqual(["user-read-currently-playing", "playlist-read-private"]);
+    for (const scope of LATER_LOGIN_SCOPES) {
+      expect(SPOTIFY_SCOPE_NAMES).toContain(scope);
+      expect(LOGIN_SCOPES as readonly string[]).not.toContain(scope);
+    }
   });
 
   it("changes only the port when SPOTIFY_LOGIN_PORT is set", () => {
@@ -84,8 +108,16 @@ describe("the authorization URL", () => {
     expect(params.get("response_type")).toBe("code");
     expect(params.get("client_id")).toBe(CLIENT_ID);
     expect(params.get("redirect_uri")).toBe(run.redirectUri);
-    expect(params.get("scope")).toBe("user-read-recently-played user-read-currently-playing playlist-read-private");
-    expect([...params.keys()].sort()).toEqual(["client_id", "redirect_uri", "response_type", "scope", "state"]);
+    expect(params.get("scope")).toBe("user-read-recently-played");
+    expect([...params.keys()].sort()).toEqual([
+      "client_id",
+      "code_challenge",
+      "code_challenge_method",
+      "redirect_uri",
+      "response_type",
+      "scope",
+      "state",
+    ]);
     expect(run.state).not.toBe("");
     await run.done;
     expectClean(run);
@@ -109,6 +141,71 @@ describe("the authorization URL", () => {
   });
 });
 
+describe("PKCE", () => {
+  it("sends an S256 code challenge with the authorization request", async () => {
+    const run = await startLogin(fake.url, { timeoutMs: 300 });
+    const params = run.authorizeUrl.searchParams;
+    expect(params.get("code_challenge_method")).toBe("S256");
+    // SHA-256 is 32 bytes: 43 characters of base64url with no padding.
+    expect(params.get("code_challenge")).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    await run.done;
+    expectClean(run);
+  });
+
+  it("sends the matching verifier with the token request, and keeps the client secret header", async () => {
+    const run = await startLogin(fake.url);
+    answer = checkingPkce(run.authorizeUrl.searchParams.get("code_challenge"));
+    await hit(run.port, run.callback({ code: CODE, state: run.state }));
+    expect(await run.done).toBe(0);
+
+    expect(fake.tokenRequests).toHaveLength(1);
+    const seen = fake.tokenRequests[0]!;
+    expect(seen.headers.authorization).toBe(`Basic ${Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64")}`);
+    const verifier = new URLSearchParams(seen.body).get("code_verifier") ?? "";
+    expect(challengeFor(verifier)).toBe(run.authorizeUrl.searchParams.get("code_challenge"));
+    expect(tokenLines(run)).toEqual([`SPOTIFY_REFRESH_TOKEN=${REFRESH_TOKEN}`]);
+  });
+
+  it("uses a verifier of 128 characters from the set Spotify allows, new every run", async () => {
+    const verifiers: string[] = [];
+    for (let index = 0; index < 2; index += 1) {
+      const run = await startLogin(fake.url);
+      answer = checkingPkce(run.authorizeUrl.searchParams.get("code_challenge"));
+      await hit(run.port, run.callback({ code: CODE, state: run.state }));
+      expect(await run.done).toBe(0);
+      verifiers.push(new URLSearchParams(fake.tokenRequests.at(-1)!.body).get("code_verifier") ?? "");
+    }
+    for (const verifier of verifiers) {
+      // The page allows 43 to 128 characters of letters, digits, underscore, period, hyphen and tilde.
+      expect(verifier).toMatch(/^[A-Za-z0-9._~-]{128}$/);
+    }
+    expect(verifiers[0]).not.toBe(verifiers[1]);
+  });
+
+  it("never prints the verifier, and never puts it in the authorization address", async () => {
+    const run = await startLogin(fake.url);
+    answer = checkingPkce(run.authorizeUrl.searchParams.get("code_challenge"));
+    await hit(run.port, run.callback({ code: CODE, state: run.state }));
+    expect(await run.done).toBe(0);
+    const verifier = new URLSearchParams(fake.tokenRequests[0]!.body).get("code_verifier") ?? "";
+    expect(verifier).not.toBe("");
+    expect(run.all()).not.toContain(verifier);
+    expect(run.authorizeUrl.href).not.toContain(verifier);
+  });
+
+  it("stops with the plain grant message when the server refuses the verifier", async () => {
+    const run = await startLogin(fake.url);
+    // The server holds the challenge of another verifier, so the one sent cannot match.
+    answer = checkingPkce(challengeFor("SYNTH_OTHER_VERIFIER".padEnd(64, "x")));
+    await hit(run.port, run.callback({ code: CODE, state: run.state }));
+    expect(await run.done).toBe(1);
+    expect(fake.tokenRequests).toHaveLength(1);
+    expect(run.err.join("")).toBe(`${loginMessages.grant}\n`);
+    expect(tokenLines(run)).toEqual([]);
+    expectClean(run);
+  });
+});
+
 describe("a good callback", () => {
   it("exchanges the code and prints the scopes and the refresh token line, once", async () => {
     const run = await startLogin(fake.url);
@@ -124,13 +221,14 @@ describe("a good callback", () => {
     expect(seen.headers["content-type"]).toBe("application/x-www-form-urlencoded");
     expect(seen.headers.authorization).toBe(`Basic ${Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64")}`);
     const form = new URLSearchParams(seen.body);
-    expect([...form.keys()].sort()).toEqual(["code", "grant_type", "redirect_uri"]);
+    expect([...form.keys()].sort()).toEqual(["client_id", "code", "code_verifier", "grant_type", "redirect_uri"]);
+    expect(form.get("client_id")).toBe(CLIENT_ID);
     expect(form.get("grant_type")).toBe("authorization_code");
     expect(form.get("code")).toBe(CODE);
     expect(form.get("redirect_uri")).toBe(run.redirectUri);
 
     expect(tokenLines(run)).toEqual([`SPOTIFY_REFRESH_TOKEN=${REFRESH_TOKEN}`]);
-    expect(run.out.join("")).toContain(`Granted scopes: ${LOGIN_SCOPES.join(" ")}`);
+    expect(run.out.join("")).toContain("Granted scopes: user-read-recently-played\n");
     expect(run.all().split(REFRESH_TOKEN)).toHaveLength(2);
     expect(run.all()).not.toContain(ACCESS_TOKEN);
     expectClean(run);
@@ -138,24 +236,126 @@ describe("a good callback", () => {
   });
 
   it("says plainly when a requested scope was not granted", async () => {
-    answer = () => json({ ...GOOD_TOKEN, scope: "user-read-recently-played" });
+    answer = () => json({ ...GOOD_TOKEN, scope: "user-read-private" });
     const run = await startLogin(fake.url);
     await hit(run.port, run.callback({ code: CODE, state: run.state }));
     expect(await run.done).toBe(0);
     const err = run.err.join("");
-    expect(err).toContain("user-read-currently-playing");
-    expect(err).toContain("playlist-read-private");
+    expect(err).toContain(loginMessages.notGranted(["user-read-recently-played"]));
     expectClean(run);
+  });
+
+  it("prints a reminder on stderr, after the token line, to store the token and clear the scrollback", async () => {
+    const run = await startLogin(fake.url);
+    await hit(run.port, run.callback({ code: CODE, state: run.state }));
+    expect(await run.done).toBe(0);
+    expect(run.err.join("")).toContain(`${loginMessages.clearReminder}\n`);
+    expect(loginMessages.clearReminder).toContain("GitHub environment secret");
+    expect(loginMessages.clearReminder).toContain("clear && printf '\\e[3J'");
+    expect(loginMessages.clearReminder).toMatch(/tmux/);
+    expect(run.out.join("")).not.toContain("GitHub environment secret");
+  });
+
+  it("prints no reminder when there is no token to clear", async () => {
+    answer = () => json({ error: "invalid_grant" }, 400);
+    const run = await startLogin(fake.url);
+    await hit(run.port, run.callback({ code: CODE, state: run.state }));
+    expect(await run.done).toBe(1);
+    expect(run.all()).not.toContain("scrollback");
   });
 });
 
-describe("a callback that is not accepted", () => {
+describe("a callback that is not from this run", () => {
   it.each([
     ["a wrong state", (run: Started) => run.callback({ code: CODE, state: `${run.state}x` })],
     ["a state of another length", (run: Started) => run.callback({ code: CODE, state: "a" })],
     ["a missing state", (run: Started) => run.callback({ code: CODE })],
     ["an empty state", (run: Started) => run.callback({ code: CODE, state: "" })],
+    ["a wrong state on an error", (run: Started) => run.callback({ error: "access_denied", state: "wrong" })],
     ["a doubled state", (run: Started) => `/callback?code=${CODE}&state=${run.state}&state=${run.state}`],
+    ["a doubled code", (run: Started) => `/callback?code=${CODE}&code=${CODE}&state=${run.state}`],
+    ["a doubled error", (run: Started) => `/callback?error=access_denied&error=access_denied&state=${run.state}`],
+  ])("answers 400 on %s, keeps listening, and the right state still finishes the run", async (_name, query) => {
+    const run = await startLogin(fake.url);
+    for (let round = 0; round < 3; round += 1) {
+      const reply = await hit(run.port, query(run));
+      expect(reply.status).toBe(400);
+      expect(reply.body).toBe(loginMessages.ignoredReply);
+      expect(reply.body).not.toContain(CODE);
+    }
+    expect(fake.tokenRequests).toHaveLength(0);
+    expect(await isClosed(run.port)).toBe(false);
+
+    expect((await hit(run.port, run.callback({ code: CODE, state: run.state }))).status).toBe(200);
+    expect(await run.done).toBe(0);
+    expect(fake.tokenRequests).toHaveLength(1);
+    expect(tokenLines(run)).toEqual([`SPOTIFY_REFRESH_TOKEN=${REFRESH_TOKEN}`]);
+    expectClean(run);
+    expect(await isClosed(run.port)).toBe(true);
+  });
+
+  it("is not ended by stray requests: only the 5 minute timer ends the run, and then it closes", async () => {
+    const run = await startLogin(fake.url, { timeoutMs: 700 });
+    expect((await hit(run.port, run.callback({ code: CODE, state: "wrong" }))).status).toBe(400);
+    expect((await hit(run.port, run.callback({ code: CODE }))).status).toBe(400);
+    expect(await run.done).toBe(1);
+    expect(run.err.join("")).toBe(`${loginMessages.timeout}\n`);
+    expect(fake.tokenRequests).toHaveLength(0);
+    expect(tokenLines(run)).toEqual([]);
+    expect(await isClosed(run.port)).toBe(true);
+    expectClean(run);
+  });
+});
+
+describe("the Host header", () => {
+  it.each([
+    ["localhost with the port", (port: number) => `localhost:${port}`],
+    ["the address with no port", () => "127.0.0.1"],
+    ["the address with another port", (port: number) => `127.0.0.1:${port + 1}`],
+    ["a name that is not this computer", () => "evil.example"],
+    ["a name that starts like it", (port: number) => `127.0.0.1:${port}.evil.example`],
+  ])("answers 400 for %s, and the run is not used up", async (_name, host) => {
+    const run = await startLogin(fake.url);
+    // A real browser sends the Host it was given, so a page that rebinds a name to 127.0.0.1 sends that name.
+    const reply = await hit(run.port, run.callback({ code: CODE, state: run.state }), "GET", { host: host(run.port) });
+    expect(reply.status).toBe(400);
+    expect(reply.body).toBe(loginMessages.ignoredReply);
+    expect(fake.tokenRequests).toHaveLength(0);
+    expect(await isClosed(run.port)).toBe(false);
+
+    expect((await hit(run.port, run.callback({ code: CODE, state: run.state }))).status).toBe(200);
+    expect(await run.done).toBe(0);
+    expectClean(run);
+  });
+
+  it.each([
+    ["no Host header at all", [] as string[]],
+    ["an empty Host header", ["Host:"]],
+  ])("answers 400 for %s", async (_name, lines) => {
+    const run = await startLogin(fake.url);
+    expect(await hitRaw(run.port, run.callback({ code: CODE, state: run.state }), lines)).toBe(400);
+    expect(fake.tokenRequests).toHaveLength(0);
+    expect((await hit(run.port, run.callback({ code: CODE, state: run.state }))).status).toBe(200);
+    expect(await run.done).toBe(0);
+  });
+
+  it("accepts exactly 127.0.0.1 and the port", async () => {
+    const run = await startLogin(fake.url);
+    const reply = await hit(run.port, run.callback({ code: CODE, state: run.state }), "GET", { host: `127.0.0.1:${run.port}` });
+    expect(reply.status).toBe(200);
+    expect(await run.done).toBe(0);
+  });
+
+  it("checks the Host before the path, so a rebinding page learns nothing from a 404", async () => {
+    const run = await startLogin(fake.url, { timeoutMs: 400 });
+    const reply = await hit(run.port, "/favicon.ico", "GET", { host: "evil.example" });
+    expect(reply.status).toBe(400);
+    await run.done;
+  });
+});
+
+describe("a callback that is from this run but cannot finish it", () => {
+  it.each([
     ["a missing code", (run: Started) => run.callback({ state: run.state })],
     ["an empty code", (run: Started) => run.callback({ code: "", state: run.state })],
   ])("stops on %s: no exchange, exit 1, listener closed", async (_name, query) => {
@@ -163,6 +363,7 @@ describe("a callback that is not accepted", () => {
     const reply = await hit(run.port, query(run));
     expect(reply.status).toBe(400);
     expect(await run.done).toBe(1);
+    expect(run.err.join("")).toBe(`${loginMessages.noCode}\n`);
     expect(fake.tokenRequests).toHaveLength(0);
     expect(tokenLines(run)).toEqual([]);
     expectClean(run);
@@ -189,7 +390,7 @@ describe("a callback that is not accepted", () => {
 
   it("does not let a second request change a failed run", async () => {
     const run = await startLogin(fake.url);
-    await hit(run.port, run.callback({ code: CODE, state: "wrong" }));
+    await hit(run.port, run.callback({ state: run.state }));
     await expect(hit(run.port, run.callback({ code: CODE, state: run.state }))).rejects.toThrow("ECONNREFUSED");
     expect(await run.done).toBe(1);
     expect(fake.tokenRequests).toHaveLength(0);
@@ -252,11 +453,12 @@ describe("a refusal from Spotify", () => {
     expectClean(run);
   });
 
-  it("checks the state before it reads an error", async () => {
-    const run = await startLogin(fake.url);
-    await hit(run.port, run.callback({ error: "access_denied", state: "wrong" }));
+  it("checks the state before it reads an error: a wrong state with an error does not end the run", async () => {
+    const run = await startLogin(fake.url, { timeoutMs: 500 });
+    const reply = await hit(run.port, run.callback({ error: "access_denied", state: "wrong" }));
+    expect(reply.status).toBe(400);
     expect(await run.done).toBe(1);
-    expect(run.err.join("")).toBe(`${loginMessages.badState}\n`);
+    expect(run.err.join("")).toBe(`${loginMessages.timeout}\n`);
   });
 });
 

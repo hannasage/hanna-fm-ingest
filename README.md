@@ -16,9 +16,11 @@ Status: in development. The export importer, the poller, item identity, the poll
 
 ```
 export SUPABASE_URL=...
-export SUPABASE_SECRET_KEY=...
+read -rs SUPABASE_SECRET_KEY; export SUPABASE_SECRET_KEY
 npm run import-export -- <path>
 ```
+
+Secrets never go on a command line as `export NAME=value`: the shell keeps that line in its history file. `read -rs NAME` waits for you to paste the value, shows nothing and stores nothing in history. Press Enter after you paste. The same holds for any secret value you type in a terminal: read it with `read -rs`, never put it in a command. The `...` after `SUPABASE_URL` stands for the address, which is not a secret.
 
 `<path>` is one Extended Streaming History `.json` file, or a directory of them. Zip files are not read: unzip first.
 
@@ -45,8 +47,10 @@ The key names the importer reads are in one table, `src/mapping.ts`. Ticket 7 ch
 ## Poll Spotify
 
 ```
-export SUPABASE_URL=... SUPABASE_SECRET_KEY=...
-export SPOTIFY_CLIENT_ID=... SPOTIFY_CLIENT_SECRET=... SPOTIFY_REFRESH_TOKEN=...
+export SUPABASE_URL=... SPOTIFY_CLIENT_ID=...
+read -rs SUPABASE_SECRET_KEY; export SUPABASE_SECRET_KEY
+read -rs SPOTIFY_CLIENT_SECRET; export SPOTIFY_CLIENT_SECRET
+read -rs SPOTIFY_REFRESH_TOKEN; export SPOTIFY_REFRESH_TOKEN
 npm run poll
 ```
 
@@ -126,7 +130,8 @@ The reminder never changes the exit code. If the read fails, it prints nothing. 
 ## Record when the login was authorized
 
 ```
-export SUPABASE_URL=... SUPABASE_SECRET_KEY=...
+export SUPABASE_URL=...
+read -rs SUPABASE_SECRET_KEY; export SUPABASE_SECRET_KEY
 npm run set-state -- spotify_authorized_at 2026-11-20
 ```
 
@@ -142,34 +147,37 @@ A bad argument exits 2 with one plain line and stores nothing. A database failur
 
 `spotify-login` runs the Spotify login once and prints a refresh token. Run it on your own computer, in a terminal, because it uses the app's client secret.
 
-1. In a terminal, export the two values. They come from the Spotify app's settings page:
+1. In a terminal, set the two values. They come from the Spotify app's settings page. The client id is not a secret. The client secret is, so it is read silently and never enters shell history:
 
    ```
    export SPOTIFY_CLIENT_ID=...
-   export SPOTIFY_CLIENT_SECRET=...
+   read -rs SPOTIFY_CLIENT_SECRET; export SPOTIFY_CLIENT_SECRET
    ```
 
-   Never pass them as arguments, and never paste them into chat. The command reads them from the environment only, and refuses any argument.
-2. Optional: to record the login date at the same time, also export `SUPABASE_URL` and `SUPABASE_SECRET_KEY`.
+   Press Enter after you paste the secret. Never pass either value as an argument, and never paste them into chat. The command reads them from the environment only, and refuses any argument.
+2. Optional: to record the login date at the same time, also set `SUPABASE_URL` (`export SUPABASE_URL=...`) and read `SUPABASE_SECRET_KEY` the same silent way: `read -rs SUPABASE_SECRET_KEY; export SUPABASE_SECRET_KEY`.
 3. Run `npm run spotify-login`.
 4. It prints an address. Open it in your own browser (the command never opens one), sign in to Spotify, and approve.
 5. The browser returns to `http://127.0.0.1:8765/callback`. The command then prints the granted scopes and one line, `SPOTIFY_REFRESH_TOKEN=<token>`.
-6. Copy the token (the part after `=`) into this repository's `production` environment secret `SPOTIFY_REFRESH_TOKEN`. Never paste it into chat, a file or a pull request. Then clear the terminal.
+6. Copy the token (the part after `=`) into this repository's `production` environment secret `SPOTIFY_REFRESH_TOKEN`. Never paste it into chat, a file or a pull request. The command also reminds you, on stderr, to do this and then clear the terminal and its scrollback, because terminals, tmux and screen recorders can keep what was printed. In many terminals this works: `clear && printf '\e[3J'`. If you use tmux, also clear its history (`tmux clear-history`). Stop any recorder before you run the login.
 
 The redirect address `http://127.0.0.1:8765/callback` is `SPOTIFY_REDIRECT_URI` in `src/settings.ts`. It must match, character for character, the redirect URI registered in the Spotify app. Spotify refuses `localhost` there, so it is the IP address. To use another port, set `SPOTIFY_LOGIN_PORT` (1024 to 65535) and register the redirect URI with that port in the Spotify app as well.
 
 What it does:
 
-- Listens on `127.0.0.1` only, for one request to `/callback`, then closes. Any other path gets 404. It gives up after 5 minutes (exit 1).
-- Makes a random `state` of 256 bits for each run and refuses a callback with a missing or wrong one (exit 1).
+- Listens on `127.0.0.1` only. It answers a request only when the `Host` header is exactly `127.0.0.1:<port>`; any other `Host` gets 400, which stops a web page that points a name at this computer. Any other path gets 404 and a request that is not a GET gets 405. One good GET to `/callback` ends the run and closes the listener. It gives up after 5 minutes (exit 1).
+- Makes a random `state` of 256 bits for each run. A callback with a wrong, missing or repeated `state` (or a repeated `code` or `error`) gets 400 and the command keeps listening, so a stray request from another web page cannot end the run. Only a request with the right `state` ends it.
+- Uses PKCE as well as the client secret: it makes a random code verifier of 128 characters from a secure random source, sends its S256 hash as `code_challenge` in the address you open, and sends the verifier with the code. The verifier is never printed.
 - A refusal in the browser (`access_denied`, or any `error`) exits 1 with a plain message.
 - Trades the code for tokens with Spotify's token endpoint, using Basic client authentication and a form body. The access token is never printed or stored.
-- Asks for the scopes in `LOGIN_SCOPES` (`src/settings.ts`): `user-read-recently-played` (the poller), `user-read-currently-playing` (a later Now playing strip) and `playlist-read-private` (a later playlist picker). It prints the scopes Spotify granted.
+- Requests only `user-read-recently-played`, the scope the poller needs (`LOGIN_SCOPES` in `src/settings.ts`). It prints the scopes Spotify granted. `user-read-currently-playing` (a later Now playing strip) and `playlist-read-private` (a later playlist picker) are listed in `LATER_LOGIN_SCOPES` in the same file for a later feature, and are not requested.
 - Prints the refresh token only when stdout is an interactive terminal. In a pipe, a file or a CI job it exits 2 before it starts, so a token never lands in a log.
 - With `SUPABASE_URL` and `SUPABASE_SECRET_KEY` set, it records `spotify_authorized_at` (today, in UTC) the same way `set-state` does. If that fails it prints a note with the `set-state` command to run, and still exits 0.
 - Never prints the client secret, the code or any response body. Redirects are refused and each request times out. `SPOTIFY_ACCOUNTS_BASE` (tests only) follows the same address rule as the poll.
 
-Exit codes: 0 done, 1 the login did not finish (refused, timed out, wrong state, a Spotify error, a busy port), 2 a bad setting, an argument, or output that is not a terminal.
+Exit codes: 0 done, 1 the login did not finish (refused, timed out, a Spotify error, a busy port), 2 a bad setting, an argument, or output that is not a terminal.
+
+More scopes later: a refresh token carries only the scopes it was authorized with. When a later feature needs more scopes, move its names from `LATER_LOGIN_SCOPES` into `LOGIN_SCOPES` in the same change as the feature, run `spotify-login` again, and store the new token as the `SPOTIFY_REFRESH_TOKEN` secret. Running the login again restarts the six month clock, and the command records the new date.
 
 Renew the login every six months. A refresh token lasts 6 months from authorization, and refreshing does not extend it. Run `spotify-login` again before then, replace the `SPOTIFY_REFRESH_TOKEN` secret, and let the command record the new date. The poll warns from day 150.
 
@@ -203,7 +211,7 @@ Merging this branch starts both schedules. Do it only after the setup steps abov
 
 ```
 export SUPABASE_URL=...
-export SUPABASE_SECRET_KEY=...
+read -rs SUPABASE_SECRET_KEY; export SUPABASE_SECRET_KEY
 export MB_USER_AGENT='AppName/1.0 ( contact )'
 npm run resolve-items [-- --limit N] [-- --retry-failed]
 ```

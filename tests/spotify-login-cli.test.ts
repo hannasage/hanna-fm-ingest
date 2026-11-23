@@ -121,6 +121,12 @@ describe("spotify-login: in a pseudo terminal", () => {
     const lines = run.output().split(/\r?\n/);
     expect(lines.filter((line) => line.startsWith("SPOTIFY_REFRESH_TOKEN="))).toEqual([`SPOTIFY_REFRESH_TOKEN=${REFRESH_TOKEN}`]);
     expect(run.output()).toContain(`Granted scopes: ${LOGIN_SCOPES.join(" ")}`);
+    // The reminder comes right after the token line and names the way to clear the scrollback.
+    const tokenAt = lines.findIndex((line) => line.startsWith("SPOTIFY_REFRESH_TOKEN="));
+    const reminderAt = lines.findIndex((line) => line.includes("GitHub environment secret"));
+    expect(tokenAt).toBeGreaterThanOrEqual(0);
+    expect(reminderAt).toBe(tokenAt + 1);
+    expect(lines[reminderAt]).toContain("clear && printf '\\e[3J'");
     expect(run.output()).toContain("Recorded spotify_authorized_at.");
     expect(expectNoSecrets(run.output())).toEqual([]);
     expect(run.output()).not.toContain(localStack().key);
@@ -149,6 +155,16 @@ describe("spotify-login: in a pseudo terminal", () => {
     expect(await run.done).toBe(0);
     expect(run.output()).toContain(`SPOTIFY_REFRESH_TOKEN=${REFRESH_TOKEN}`);
     expect(run.output()).toContain(`npm run set-state -- spotify_authorized_at ${today()}`);
+  });
+
+  it("keeps listening after a request with a wrong state, and finishes on the right one", async () => {
+    const port = await freePort();
+    const run = startInPty(base({ SPOTIFY_LOGIN_PORT: String(port) }));
+    const state = new URL((await run.line(/\/authorize\?/)).trim()).searchParams.get("state") ?? "";
+    expect((await hit(port, `/callback?code=${CODE}&state=wrong`)).status).toBe(400);
+    expect((await hit(port, `/callback?code=${CODE}&state=${encodeURIComponent(state)}`)).status).toBe(200);
+    expect(await run.done).toBe(0);
+    expect(run.output()).toContain(`SPOTIFY_REFRESH_TOKEN=${REFRESH_TOKEN}`);
   });
 
   it("exits 1 on access_denied and prints no token", async () => {
