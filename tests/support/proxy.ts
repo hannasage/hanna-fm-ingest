@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { localStack } from "./env.ts";
 
-/** What the proxy does with one write request to the plays table. */
+/** What the proxy does with one write request to the watched table. */
 export type Rule =
   | { pass: true }
   | { status: number; body: string };
@@ -10,7 +10,7 @@ export type Rule =
 export type Proxy = {
   /** The address to give the command as SUPABASE_URL. */
   url: string;
-  /** How many writes to the plays table the proxy has seen. */
+  /** How many writes to the watched table the proxy has seen. */
   writes: () => number;
   close: () => Promise<void>;
 };
@@ -25,15 +25,21 @@ async function readBody(request: IncomingMessage): Promise<Buffer> {
  * A local pass-through in front of the local Supabase stack. It lets a test make one
  * chosen write fail or answer oddly, while every other request reaches the real database.
  * `rule` gets the number of the write (1 is the first) and says what to do with it.
+ * By default it watches POST requests to the plays table. `options` names another table, or other methods.
  */
-export async function startProxy(rule: (write: number) => Rule): Promise<Proxy> {
+export async function startProxy(
+  rule: (write: number) => Rule,
+  options: { table?: string; methods?: string[] } = {},
+): Promise<Proxy> {
+  const table = options.table ?? "plays";
+  const methods = options.methods ?? ["POST"];
   const target = localStack().url;
   let writes = 0;
 
   const server: Server = createServer((request, response) => {
     void (async () => {
       const body = await readBody(request);
-      const isWrite = request.method === "POST" && (request.url ?? "").startsWith("/rest/v1/plays");
+      const isWrite = methods.includes(request.method ?? "") && (request.url ?? "").startsWith(`/rest/v1/${table}`);
       if (isWrite) {
         writes += 1;
         const decision = rule(writes);

@@ -3,8 +3,30 @@ import { basename, join } from "node:path";
 import { COLUMN_KEYS, SIGNAL_KEYS } from "./mapping.ts";
 import { MAX_FILE_BYTES } from "./settings.ts";
 
-/** An error whose message is safe to show: it never holds file content or a secret. */
-export class UserError extends Error {}
+/** Why a poll run failed, as a fixed word. It is stored with the run record, so it holds no secret and no data. */
+export type FailureKind =
+  | "login_expired"
+  | "forbidden"
+  | "rate_limited"
+  | "bad_response"
+  | "network"
+  | "future_cursor"
+  | "malformed_items"
+  | "page_cap"
+  | "other";
+
+/**
+ * An error whose message is safe to show: it never holds file content or a secret.
+ * A failure of the poll may also name its kind, for the run record.
+ */
+export class UserError extends Error {
+  readonly kind: FailureKind | undefined;
+
+  constructor(message: string, kind?: FailureKind) {
+    super(message);
+    this.kind = kind;
+  }
+}
 
 /** Every key the importer reads, for the check that a file uses the mapped names. */
 const MAPPED_KEYS: string[] = [...Object.values(COLUMN_KEYS), ...Object.values(SIGNAL_KEYS)];

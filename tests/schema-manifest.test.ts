@@ -49,4 +49,12 @@ describe("vendored migrations", () => {
     expect(plays.startsWith("create table public.plays (")).toBe(true);
     expect(plays).toContain("create index plays_ended_at_idx on public.plays (ended_at);");
   });
+
+  it("hold the poller status tables from the frozen contract, after items", () => {
+    const files = readdirSync(migrations).filter((name) => name.endsWith(".sql")).sort();
+    expect(files.indexOf("20261123050000_poller_status.sql")).toBeGreaterThan(files.indexOf("20261123040000_items.sql"));
+    const status = readFileSync(join(migrations, "20261123050000_poller_status.sql"), "utf8");
+    expect(status.startsWith("create table public.poller_runs (")).toBe(true);
+    expect(status).toContain("create table public.poller_state (");
+  });
 });

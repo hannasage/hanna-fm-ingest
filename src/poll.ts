@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { UserError } from "./files.ts";
+import { UserError, type FailureKind } from "./files.ts";
 import {
   endedAtToCursorMs,
   mapItem,
@@ -92,6 +92,18 @@ export function pollProblems(counts: PollCounts): string[] {
   return problems;
 }
 
+/**
+ * The kind to store for a finished run that must still exit 1, or null when the run is green.
+ * One kind per run. A stop short of older plays comes first, because plays may be missing.
+ * "No older page" (`stalled`) is `other`: it is not the page cap.
+ */
+export function pollProblemKind(counts: PollCounts): FailureKind | null {
+  if (counts.gap === "capped") return "page_cap";
+  if (counts.gap === "stalled") return "other";
+  if (counts.skipped.malformed > 0) return "malformed_items";
+  return null;
+}
+
 /** Plain lines for a poll that is green but kept nothing because every item was a local file or an episode. */
 export function pollNotes(counts: PollCounts): string[] {
   return keptNothing(counts) && counts.skipped.malformed === 0 ? [POLL_MESSAGES.onlyNoTrack(counts.fetched)] : [];
@@ -141,7 +153,7 @@ async function latestEndedAt(client: SupabaseClient, nowMs: number): Promise<num
   const cursor = endedAtToCursorMs(row.ended_at);
   if (cursor === null) throw new UserError("The database gave an end time the poll cannot read.");
   // A bad row ahead of the clock would hide every real play. Say so; never clamp it away.
-  if (cursor > nowMs + FUTURE_TOLERANCE_SECONDS * 1000) throw new UserError(POLL_MESSAGES.futureCursor);
+  if (cursor > nowMs + FUTURE_TOLERANCE_SECONDS * 1000) throw new UserError(POLL_MESSAGES.futureCursor, "future_cursor");
   return cursor;
 }
 

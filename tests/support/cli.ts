@@ -114,6 +114,14 @@ export function runImport(
   return run("import-export", path === undefined ? [] : [path], env);
 }
 
+/** Runs `set-state <key> <value>`. Pass `env` to replace the connection values. */
+export function runSetState(
+  args: string[],
+  env: Record<string, string | undefined> = {},
+): CliResult {
+  return run("set-state", args, env);
+}
+
 /** Same as runImport, without blocking, so two imports can run at once. */
 export function runImportAsync(
   path: string,
