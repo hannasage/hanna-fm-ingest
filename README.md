@@ -93,6 +93,21 @@ Other behavior:
 
 Scheduled runs start only from the default branch, and forks do not run them.
 
+## Keep the scheduled poll switched on
+
+This repository is public. GitHub's documentation for the `schedule` event says: "In a public repository, scheduled workflows are automatically disabled when no repository activity has occurred in 60 days." The poll is a scheduled workflow, so it can be switched off this way.
+
+`.github/workflows/keepalive.yml` runs once a month (06:23 UTC on the 1st) and by hand. It calls GitHub's documented "Enable a workflow" endpoint for `poll.yml`, reads the workflow's state back, and fails the run unless the state is `active`. It has the `actions: write` permission and nothing else, uses no secret and no action. It runs only the `gh` program that GitHub-hosted runners carry. A failed run shows red and sends GitHub's usual failure email.
+
+What is verified and what is not:
+
+- Verified from the docs: the 60-day rule; the endpoint (`PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/enable`), which "enables a workflow and sets the state of the workflow to active" and needs the Actions write permission. Verified by a real call: the endpoint returns 204 for a workflow that is already active, so the monthly call does not fail on a healthy one.
+- Unverified: the docs do not say that re-enabling resets the 60-day clock, and they do not say what counts as repository activity. So the keepalive is a best effort, not a proven guard. It is also a scheduled workflow itself, so the same rule applies to it.
+- Fallback 1: the site's poller-health check (a later ticket) warns when no poll has run.
+- Fallback 2: a person re-enables the workflow by hand: Actions tab, `poll`, "Enable workflow", or `gh workflow enable poll.yml`.
+
+Merging this branch starts both schedules. Do it only after the setup steps above.
+
 ## Resolve items
 
 ```
