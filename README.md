@@ -1,6 +1,6 @@
 # hanna-fm-ingest
 
-The private data side of hanna.fm. It polls Spotify every 30 minutes, imports Spotify's Extended Streaming History export, resolves items to MusicBrainz IDs, and builds the derived data the site shows.
+The data side of hanna.fm. It polls Spotify every 30 minutes, imports Spotify's Extended Streaming History export, resolves items to MusicBrainz IDs, and builds the derived data the site shows.
 
 Status: in development. The export importer, the poller and item identity are built.
 
@@ -189,3 +189,18 @@ HANNA_FM_PATH=../hanna-fm npm run schema:check
 ```
 
 It checks the manifest, and the site clone when `HANNA_FM_PATH` is set. CI cannot do the site comparison: the site repository is private, and CI cannot read it. CI runs the manifest check through the tests only. A CI diff against the site becomes possible once the site repository is public.
+
+## Make your own
+
+This tool fills the database that the hanna.fm website reads. To run your own copy, for noncommercial purposes, you will need:
+
+- A Supabase project, with the migrations from the website repository applied.
+- A Spotify developer app in Development Mode. Spotify requires the app owner to have Premium.
+- Your own Extended Streaming History export, requested from Spotify's account privacy page.
+- A descriptive MusicBrainz User-Agent with your own contact detail, set in `MB_USER_AGENT`.
+
+A setup guide is not written yet. Spotify, MusicBrainz and Last.fm each have their own terms for what you may do with their data. Read them before you publish a fork. Never commit an export file: it carries IP addresses.
+
+## License
+
+PolyForm Noncommercial 1.0.0. You may use, change and share this software for noncommercial purposes, including personal, hobby, research and educational use. You may not use it in a paid product or for commercial gain. This is a source-available license, not an open source license as the OSI defines one. See `LICENSE`.
