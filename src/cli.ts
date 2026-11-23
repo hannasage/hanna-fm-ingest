@@ -1,12 +1,21 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { addressProblem } from "./address.ts";
+import { addressProblem, spotifyAddressProblem } from "./address.ts";
 import { UserError } from "./files.ts";
 import { importExport } from "./import-export.ts";
 import { acquireLock, refreshLock, releaseLock, type Lease } from "./job-lock.ts";
 import { MusicBrainz } from "./musicbrainz.ts";
-import { emptyCounts, formatReport } from "./report.ts";
+import { emptyPollCounts, poll, pollNotes, pollProblems } from "./poll.ts";
+import { emptyCounts, formatPollReport, formatReport } from "./report.ts";
 import { formatResolveReport, resolveItems, emptyResolveCounts } from "./resolve-items.ts";
-import { DEFAULT_MB_API_BASE, RESOLVE_LOCK_LEASE_MS, RESOLVE_LOCK_NAME, RESOLVE_MAX_ATTEMPTS } from "./settings.ts";
+import {
+  DEFAULT_MB_API_BASE,
+  DEFAULT_SPOTIFY_ACCOUNTS_BASE,
+  DEFAULT_SPOTIFY_API_BASE,
+  RESOLVE_LOCK_LEASE_MS,
+  RESOLVE_LOCK_NAME,
+  RESOLVE_MAX_ATTEMPTS,
+} from "./settings.ts";
+import type { SpotifyConfig } from "./spotify.ts";
 import { SupabaseCache } from "./item-store.ts";
 
 const IMPORT_USAGE =
@@ -18,7 +27,8 @@ const RESOLVE_USAGE = [
   `  --retry-failed  try items that have failed ${RESOLVE_MAX_ATTEMPTS} times or more (exhausted items)`,
   "  Exit codes: 0 done, 1 stopped, or items stayed pending, or items are stuck (exhausted), 2 bad setting or argument, 3 another run holds the lock.",
 ].join("\n");
-const USAGE = `${IMPORT_USAGE}\n${RESOLVE_USAGE}`;
+const POLL_USAGE = "Usage: poll\n  Reads recent plays from Spotify and stores the new ones. It takes no arguments.";
+const USAGE = `${IMPORT_USAGE}\n${RESOLVE_USAGE}\n${POLL_USAGE}`;
 
 function fail(message: string, code: number): never {
   process.stderr.write(`${message}\n`);
@@ -73,6 +83,55 @@ async function runImport(path: string | undefined, extra: string[]): Promise<voi
       1,
     );
   }
+}
+
+/** A required variable, or exit 2 naming it. */
+function required(name: string): string {
+  const value = process.env[name];
+  if (!value) fail(`${name} is not set.`, 2);
+  return value;
+}
+
+function spotifyConfig(): SpotifyConfig {
+  const clientId = required("SPOTIFY_CLIENT_ID");
+  const clientSecret = required("SPOTIFY_CLIENT_SECRET");
+  const refreshToken = required("SPOTIFY_REFRESH_TOKEN");
+  const base = (name: string, fallback: string, host: string) => {
+    const address = process.env[name] || fallback;
+    const problem = spotifyAddressProblem(name, address, host);
+    if (problem !== null) fail(problem, 2);
+    return address.replace(/\/+$/, "");
+  };
+  return {
+    clientId,
+    clientSecret,
+    refreshToken,
+    accountsBase: base("SPOTIFY_ACCOUNTS_BASE", DEFAULT_SPOTIFY_ACCOUNTS_BASE, "accounts.spotify.com"),
+    apiBase: base("SPOTIFY_API_BASE", DEFAULT_SPOTIFY_API_BASE, "api.spotify.com"),
+  };
+}
+
+async function runPoll(): Promise<void> {
+  const client = connect();
+  const config = spotifyConfig();
+
+  const counts = emptyPollCounts();
+  try {
+    await poll(client, config, counts, (line) => process.stderr.write(`${line}\n`));
+  } catch (error) {
+    // A UserError holds fixed text. Any other failure shows its kind only, never its text,
+    // which could hold a token, a key or a play.
+    process.stderr.write(`${describeStop(error, "poll")}\n`);
+    process.exit(1);
+  }
+  process.stdout.write(formatPollReport(counts));
+  // A run that skipped a malformed item (and so maybe stored nothing by mistake), or stopped short, is never green.
+  // Each line is a GitHub annotation, so the run page shows it.
+  const problems = pollProblems(counts);
+  for (const problem of problems) process.stderr.write(`::error::${problem}\n`);
+  // A window of only local files and episodes is green. It gets a plain note, not an annotation.
+  for (const note of pollNotes(counts)) process.stderr.write(`${note}\n`);
+  if (problems.length > 0) process.exit(1);
 }
 
 /** MusicBrainz asks every client for a User-Agent that says who it is. A header cannot hold a line break or a non-ASCII character. */
@@ -192,6 +251,10 @@ async function main(argv: string[]): Promise<void> {
   const [command, ...rest] = argv;
   if (command === "import-export") await runImport(rest[0], rest.slice(1));
   else if (command === "resolve-items") await runResolve(rest);
+  else if (command === "poll") {
+    if (rest.length > 0) fail(POLL_USAGE, 2);
+    await runPoll();
+  }
   else fail(USAGE, 2);
 }
 

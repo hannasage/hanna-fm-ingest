@@ -9,6 +9,7 @@
   },
   "scripts": {
     "import-export": "tsx src/cli.ts import-export",
+    "poll": "tsx src/cli.ts poll",
     "resolve-items": "tsx src/cli.ts resolve-items",
     "schema:sync": "tsx src/schema-sync.ts",
     "schema:check": "tsx src/schema-check.ts",
