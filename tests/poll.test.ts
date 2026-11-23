@@ -248,21 +248,49 @@ describe("poll: storing plays", () => {
     expect(second.fake.recentRequests[0]!.query.get("after")).toBe(String(ms("2026-11-20T10:04:09.000Z")));
   });
 
-  it("skips local files and anything that is not a track, and counts them by reason", async () => {
+  it("skips local files and episodes as no_track, and nothing else", async () => {
     const items = [
       item(1, "2026-11-20T10:00:00Z"),
       item(2, "2026-11-20T10:01:00Z", { is_local: true, uri: "spotify:local:Synthetic+Artist::Synthetic+Song::200" }),
       item(3, "2026-11-20T10:02:00Z", { type: "episode", uri: "spotify:episode:SYNTH000000000003" }),
-      item(4, "2026-11-20T10:03:00Z", { uri: "spotify:artist:SYNTH000000000004" }),
-      { track: null, played_at: "2026-11-20T10:04:00Z" },
-      { played_at: "2026-11-20T10:05:00Z" },
     ];
     const { result } = await poll({ recent: () => page(items) });
 
     expect(result.status).toBe(0);
-    expect(counts(result.stdout)).toMatchObject({ fetched: 6, stored: 1, duplicate: 0, skipped: 5, no_track: 5, malformed: 0 });
+    expect(counts(result.stdout)).toMatchObject({ fetched: 3, stored: 1, duplicate: 0, skipped: 2, no_track: 2, malformed: 0 });
     expectBalanced(result);
     expect(await stored()).toHaveLength(1);
+  });
+
+  it("reads a renamed or missing track field as malformed, never as a local file, and exits 1", async () => {
+    const items = [
+      item(1, "2026-11-20T10:00:00Z"),
+      item(2, "2026-11-20T10:01:00Z", { uri: "spotify:artist:SYNTH000000000002" }),
+      item(3, "2026-11-20T10:02:00Z", { type: undefined }),
+      item(4, "2026-11-20T10:03:00Z", { uri: undefined }),
+      item(5, "2026-11-20T10:04:00Z", { type: "ad" }),
+      { track: null, played_at: "2026-11-20T10:05:00Z" },
+      { played_at: "2026-11-20T10:06:00Z" },
+      { item: item(7, "2026-11-20T10:07:00Z").track, played_at: "2026-11-20T10:07:00Z" },
+    ];
+    const { result } = await poll({ recent: () => page(items) });
+
+    expect(result.status).toBe(1);
+    expect(counts(result.stdout)).toMatchObject({ fetched: 8, stored: 1, duplicate: 0, skipped: 7, no_track: 0, malformed: 7 });
+    expectBalanced(result);
+    expect(await stored()).toHaveLength(1);
+    expect(result.stderr).toBe(`::error::${MSG.someMalformed(7)}\n`);
+  });
+
+  it("exits 1 when the track object is missing on every item", async () => {
+    const items = [1, 2, 3].map((n) => ({ played_at: `2026-11-20T10:0${n}:00Z`, item: item(n, "2026-11-20T10:00:00Z").track }));
+    const { result } = await poll({ recent: () => page(items) });
+
+    expect(result.status).toBe(1);
+    expect(counts(result.stdout)).toMatchObject({ fetched: 3, stored: 0, skipped: 3, no_track: 0, malformed: 3 });
+    expect(result.stderr).toBe(`::error::${MSG.allSkipped(3)}\n`);
+    expect(await stored()).toHaveLength(0);
+    expectNoSecrets(result);
   });
 
   it("skips an item with a missing or invalid field as malformed, stores the valid ones, then exits 1", async () => {

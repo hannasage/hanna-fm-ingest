@@ -49,26 +49,29 @@ export function playedAtMs(raw: unknown): number | null {
 
 /**
  * Item shape: { track: { uri, name, type, is_local, duration_ms, artists: [{ name }], album: { name } }, played_at }.
- * - Not a track (a local file, an episode, a missing track, a URI that is not a track URI): skipped as no_track.
- * - A missing or odd field on a track, a name over MAX_TEXT_CHARS, or a played_at more than
- *   FUTURE_TOLERANCE_SECONDS after `nowMs`: skipped as malformed.
+ * - A local file (`is_local` is true) or an episode (`type` is "episode"): skipped as no_track. Only these two.
+ * - Anything else that is not a readable track is skipped as malformed: a missing or renamed `track`
+ *   object, a missing `type`, a missing or bad `uri`, a missing or odd field, a name over MAX_TEXT_CHARS,
+ *   or a played_at more than FUTURE_TOLERANCE_SECONDS after `nowMs`. A renamed field must be loud, so it
+ *   never reads as a local file.
  * - The artist is the track's first listed artist. The export holds the album artist, which can differ.
  *   Ticket 7 compares them with real data.
  */
 export function mapItem(raw: unknown, nowMs: number): Mapped {
   if (!isRecord(raw)) return { skipped: "malformed" };
   const track = raw.track;
-  if (!isRecord(track)) return { skipped: "no_track" };
+  if (!isRecord(track)) return { skipped: "malformed" };
+
+  if (track.is_local === true || track.type === "episode") return { skipped: "no_track" };
 
   const uri = track.uri;
   if (
-    track.is_local === true ||
     track.type !== "track" ||
     typeof uri !== "string" ||
     !uri.startsWith(TRACK_URI_PREFIX) ||
     uri.length === TRACK_URI_PREFIX.length
   ) {
-    return { skipped: "no_track" };
+    return { skipped: "malformed" };
   }
 
   const artists = Array.isArray(track.artists) ? track.artists : [];

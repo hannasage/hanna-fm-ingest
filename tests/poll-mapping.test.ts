@@ -69,6 +69,24 @@ describe("mapItem", () => {
     expect(mapped).toMatchObject({ durationMs: null });
   });
 
+  it("skips only a local file or an episode as no_track", () => {
+    expect(mapItem(raw("2026-11-20T10:00:00Z", { is_local: true, uri: "spotify:local:a::b::1" }), NOW)).toEqual({ skipped: "no_track" });
+    expect(mapItem(raw("2026-11-20T10:00:00Z", { type: "episode", uri: "spotify:episode:SYNTH1" }), NOW)).toEqual({ skipped: "no_track" });
+  });
+
+  it.each([
+    ["a missing track", { played_at: "2026-11-20T10:00:00Z" }],
+    ["a null track", { played_at: "2026-11-20T10:00:00Z", track: null }],
+    ["a renamed track object", { played_at: "2026-11-20T10:00:00Z", item: {} }],
+    ["a missing type", raw("2026-11-20T10:00:00Z", { type: undefined })],
+    ["an unknown type", raw("2026-11-20T10:00:00Z", { type: "ad" })],
+    ["a missing uri", raw("2026-11-20T10:00:00Z", { uri: undefined })],
+    ["a uri that is not a track uri", raw("2026-11-20T10:00:00Z", { uri: "spotify:artist:SYNTH1" })],
+    ["an empty track uri", raw("2026-11-20T10:00:00Z", { uri: "spotify:track:" })],
+  ])("reads %s as malformed, not as a local file", (_name, value) => {
+    expect(mapItem(value, NOW)).toEqual({ skipped: "malformed" });
+  });
+
   it("treats the future by 60 seconds: 60 is fine, 61 is malformed", () => {
     const at = (secondsAhead: number) => new Date(NOW + secondsAhead * 1000).toISOString();
     expect(mapItem(raw(at(60)), NOW)).toHaveProperty("play");

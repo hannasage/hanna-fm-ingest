@@ -65,12 +65,13 @@ Repeats:
 Exit 1 (with a `::error::` annotation for the first three):
 
 - Every fetched item was skipped and at least one is malformed, so nothing was stored by mistake (a renamed field looks like this).
+- Any item that is not clearly a local file or an episode and cannot be read as a track is malformed. That includes a missing `track` object, a missing `type`, and a missing or bad `uri`.
 - Any item is malformed. The valid plays are stored first.
 - The page limit was reached, or Spotify gave no older page.
 - The newest stored play is more than 60 seconds ahead of the clock. The poll names the problem and stops before it uses the login. Fix or delete that row.
 - A rejected or expired login, 401, 403, 429 (with the retry hint when Spotify sends one), malformed JSON, a response over 1 MB, a page of more than 50 items, and any network failure. No message holds a token, a key or a response body.
 
-Exit 0 with a plain note on stderr: every fetched item was a local file or an episode (`no_track`), so nothing was stored and nothing is malformed. A window like that is normal, and it stays green until a real play appears.
+Exit 0 with a plain note on stderr: every fetched item was a local file (`is_local` is true) or an episode (`type` is `episode`), the only two things the poll skips as `no_track`, so nothing was stored and nothing is malformed. A window like that is normal, and it stays green until a real play appears.
 
 Limits on what Spotify sends: a play stamped more than 60 seconds in the future, or a track, artist or album text over 500 characters, is malformed. A response body over 1 MB is refused. The limits are named in `src/settings.ts`.
 
